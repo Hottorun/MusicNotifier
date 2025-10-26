@@ -10,9 +10,33 @@
 		960038542E38135E00C3FB0F /* MusicNotifier.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MusicNotifier.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		969DFA722E8AADCF003C892C /* Exceptions for "MusicNotifier" folder in "MusicNotifier" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				requests/FetchLibraryArtist.swift,
+			);
+			target = 960038532E38135E00C3FB0F /* MusicNotifier */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+		969DFA732E8AADCF003C892C /* Exceptions for "MusicNotifier" folder in "Copy Bundle Resources" phase from "MusicNotifier" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			buildPhase = 960038522E38135E00C3FB0F /* Resources */;
+			membershipExceptions = (
+				requests/FetchLibraryArtist.swift,
+			);
+		};
+/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		960038562E38135E00C3FB0F /* MusicNotifier */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				969DFA722E8AADCF003C892C /* Exceptions for "MusicNotifier" folder in "MusicNotifier" target */,
+				969DFA732E8AADCF003C892C /* Exceptions for "MusicNotifier" folder in "Copy Bundle Resources" phase from "MusicNotifier" target */,
+			);
 			path = MusicNotifier;
 			sourceTree = "<group>";
 		};
@@ -253,6 +277,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSAppleMusicUsageDescription = "This app needs access to your music library to track the artists you follow";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -280,6 +305,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSAppleMusicUsageDescription = "This app needs access to your music library to track the artists you follow";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
