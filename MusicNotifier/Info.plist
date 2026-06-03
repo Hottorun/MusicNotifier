@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSAppleMusicUsageDescription</key>
+	<string>MusicNotifier needs access to your Apple Music library to track new releases from your favorite artists.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>MusicNotifier needs calendar access so you can add upcoming releases to your calendar.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>MusicNotifier needs calendar access so you can add upcoming releases to your calendar.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>MusicNotifier uses your location to surface concerts happening near you.</string>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).release-refresh</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>functional.MusicNotifier</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>musicnotifier</string>
+			</array>
+		</dict>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>processing</string>
+		<string>fetch</string>
+		<string>remote-notification</string>
+	</array>
+</dict>
+</plist>

@@ -10,8 +10,11 @@ import SwiftData
 
 @Model
 final class Item {
-    var timestamp: Date
-    
+    // CloudKit-mirrored SwiftData requires every persistent attribute to be
+    // optional or have a default. Without this default, the store refuses to
+    // load.
+    var timestamp: Date = Date()
+
     init(timestamp: Date) {
         self.timestamp = timestamp
     }

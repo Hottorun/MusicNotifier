@@ -6,44 +6,94 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		96AA00102E90000000000001 /* MusicNotifierWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 96AA00022E90000000000001 /* MusicNotifierWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		96AA00112E90000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 9600384C2E38135E00C3FB0F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 96AA00092E90000000000001;
+			remoteInfo = MusicNotifierWidgets;
+		};
+		96BB00072E91000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 9600384C2E38135E00C3FB0F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 960038532E38135E00C3FB0F;
+			remoteInfo = MusicNotifier;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		96AA00082E90000000000001 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				96AA00102E90000000000001 /* MusicNotifierWidgets.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		960038542E38135E00C3FB0F /* MusicNotifier.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MusicNotifier.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		96AA00022E90000000000001 /* MusicNotifierWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MusicNotifierWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		96BB00022E91000000000001 /* MusicNotifierTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MusicNotifierTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
 		969DFA722E8AADCF003C892C /* Exceptions for "MusicNotifier" folder in "MusicNotifier" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
-				requests/FetchLibraryArtist.swift,
+				Info.plist,
 			);
 			target = 960038532E38135E00C3FB0F /* MusicNotifier */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
-
-/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
-		969DFA732E8AADCF003C892C /* Exceptions for "MusicNotifier" folder in "Copy Bundle Resources" phase from "MusicNotifier" target */ = {
-			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
-			buildPhase = 960038522E38135E00C3FB0F /* Resources */;
-			membershipExceptions = (
-				requests/FetchLibraryArtist.swift,
-			);
-		};
-/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		960038562E38135E00C3FB0F /* MusicNotifier */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 				969DFA722E8AADCF003C892C /* Exceptions for "MusicNotifier" folder in "MusicNotifier" target */,
-				969DFA732E8AADCF003C892C /* Exceptions for "MusicNotifier" folder in "Copy Bundle Resources" phase from "MusicNotifier" target */,
 			);
 			path = MusicNotifier;
+			sourceTree = "<group>";
+		};
+		96AA00042E90000000000001 /* MusicNotifierWidgets */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = MusicNotifierWidgets;
+			sourceTree = "<group>";
+		};
+		96BB00032E91000000000001 /* MusicNotifierTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = MusicNotifierTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		960038512E38135E00C3FB0F /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		96AA00062E90000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		96BB00062E91000000000001 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -57,6 +107,8 @@
 			isa = PBXGroup;
 			children = (
 				960038562E38135E00C3FB0F /* MusicNotifier */,
+				96AA00042E90000000000001 /* MusicNotifierWidgets */,
+				96BB00032E91000000000001 /* MusicNotifierTests */,
 				960038552E38135E00C3FB0F /* Products */,
 			);
 			sourceTree = "<group>";
@@ -65,6 +117,8 @@
 			isa = PBXGroup;
 			children = (
 				960038542E38135E00C3FB0F /* MusicNotifier.app */,
+				96AA00022E90000000000001 /* MusicNotifierWidgets.appex */,
+				96BB00022E91000000000001 /* MusicNotifierTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -79,10 +133,12 @@
 				960038502E38135E00C3FB0F /* Sources */,
 				960038512E38135E00C3FB0F /* Frameworks */,
 				960038522E38135E00C3FB0F /* Resources */,
+				96AA00082E90000000000001 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				96AA00122E90000000000001 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				960038562E38135E00C3FB0F /* MusicNotifier */,
@@ -94,6 +150,51 @@
 			productReference = 960038542E38135E00C3FB0F /* MusicNotifier.app */;
 			productType = "com.apple.product-type.application";
 		};
+		96AA00092E90000000000001 /* MusicNotifierWidgets */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 96AA00132E90000000000001 /* Build configuration list for PBXNativeTarget "MusicNotifierWidgets" */;
+			buildPhases = (
+				96AA00052E90000000000001 /* Sources */,
+				96AA00062E90000000000001 /* Frameworks */,
+				96AA00072E90000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				96AA00042E90000000000001 /* MusicNotifierWidgets */,
+			);
+			name = MusicNotifierWidgets;
+			packageProductDependencies = (
+			);
+			productName = MusicNotifierWidgets;
+			productReference = 96AA00022E90000000000001 /* MusicNotifierWidgets.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		96BB00042E91000000000001 /* MusicNotifierTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 96BB00092E91000000000001 /* Build configuration list for PBXNativeTarget "MusicNotifierTests" */;
+			buildPhases = (
+				96BB00052E91000000000001 /* Sources */,
+				96BB00062E91000000000001 /* Frameworks */,
+				96BB00082E91000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				96BB000B2E91000000000001 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				96BB00032E91000000000001 /* MusicNotifierTests */,
+			);
+			name = MusicNotifierTests;
+			packageProductDependencies = (
+			);
+			productName = MusicNotifierTests;
+			productReference = 96BB00022E91000000000001 /* MusicNotifierTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -102,10 +203,17 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1640;
-				LastUpgradeCheck = 1640;
+				LastUpgradeCheck = 2650;
 				TargetAttributes = {
 					960038532E38135E00C3FB0F = {
 						CreatedOnToolsVersion = 16.4;
+					};
+					96AA00092E90000000000001 = {
+						CreatedOnToolsVersion = 16.4;
+					};
+					96BB00042E91000000000001 = {
+						CreatedOnToolsVersion = 16.4;
+						TestTargetID = 960038532E38135E00C3FB0F;
 					};
 				};
 			};
@@ -124,12 +232,28 @@
 			projectRoot = "";
 			targets = (
 				960038532E38135E00C3FB0F /* MusicNotifier */,
+				96AA00092E90000000000001 /* MusicNotifierWidgets */,
+				96BB00042E91000000000001 /* MusicNotifierTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		960038522E38135E00C3FB0F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		96AA00072E90000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		96BB00082E91000000000001 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -146,7 +270,34 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		96AA00052E90000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		96BB00052E91000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		96AA00122E90000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 96AA00092E90000000000001 /* MusicNotifierWidgets */;
+			targetProxy = 96AA00112E90000000000001 /* PBXContainerItemProxy */;
+		};
+		96BB000B2E91000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 960038532E38135E00C3FB0F /* MusicNotifier */;
+			targetProxy = 96BB00072E91000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		9600385F2E38136100C3FB0F /* Debug */ = {
@@ -207,6 +358,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -263,6 +415,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
 			};
@@ -273,11 +426,16 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = MusicNotifier/MusicNotifier.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JD6NETLE45;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSAppleMusicUsageDescription = "This app needs access to your music library to track the artists you follow";
+				INFOPLIST_FILE = MusicNotifier/Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.music";
+				INFOPLIST_KEY_NSAppleMusicUsageDescription = "MusicNotifier reads your Apple Music library so it can track your artists and notify you when they release new music.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -288,11 +446,16 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = functional.MusicNotifier;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kern.functional.MusicNotifier;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = YES;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = "1,2,6";
 			};
 			name = Debug;
 		};
@@ -301,11 +464,16 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = MusicNotifier/MusicNotifier.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JD6NETLE45;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSAppleMusicUsageDescription = "This app needs access to your music library to track the artists you follow";
+				INFOPLIST_FILE = MusicNotifier/Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.music";
+				INFOPLIST_KEY_NSAppleMusicUsageDescription = "MusicNotifier reads your Apple Music library so it can track your artists and notify you when they release new music.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -316,11 +484,116 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = functional.MusicNotifier;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kern.functional.MusicNotifier;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = YES;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,6";
+			};
+			name = Release;
+		};
+		96AA00142E90000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = MusicNotifierWidgets/MusicNotifierWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JD6NETLE45;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "MusicNotifierWidgets-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kern.functional.MusicNotifier.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		96AA00152E90000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = MusicNotifierWidgets/MusicNotifierWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JD6NETLE45;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "MusicNotifierWidgets-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kern.functional.MusicNotifier.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		96BB000C2E91000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = MNMFVK9ATJ;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = functional.MusicNotifierTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MusicNotifier.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/MusicNotifier";
+			};
+			name = Debug;
+		};
+		96BB000D2E91000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = MNMFVK9ATJ;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = functional.MusicNotifierTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MusicNotifier.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/MusicNotifier";
 			};
 			name = Release;
 		};
@@ -341,6 +614,24 @@
 			buildConfigurations = (
 				960038622E38136100C3FB0F /* Debug */,
 				960038632E38136100C3FB0F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		96AA00132E90000000000001 /* Build configuration list for PBXNativeTarget "MusicNotifierWidgets" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				96AA00142E90000000000001 /* Debug */,
+				96AA00152E90000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		96BB00092E91000000000001 /* Build configuration list for PBXNativeTarget "MusicNotifierTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				96BB000C2E91000000000001 /* Debug */,
+				96BB000D2E91000000000001 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
