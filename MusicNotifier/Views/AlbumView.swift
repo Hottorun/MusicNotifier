@@ -68,6 +68,14 @@ struct AlbumView: View {
     @State private var artistPushTarget: ArtistData?
     @State private var addedSongIDs: Set<String> = []
     @State private var addingSongIDs: Set<String> = []
+    /// Tracks the user added in this view session. Drives the brief plus → check
+    /// confirmation flash before the button collapses to a transparent spacer.
+    @State private var justAddedSongIDs: Set<String> = []
+    /// True once `loadTracks()` has run to completion (success or failure). Used
+    /// to switch the tracklist section between the skeleton placeholder and the
+    /// real list — without it, an empty cold-cache album shows a hero/actions
+    /// stack followed by abrupt empty space until the network responds.
+    @State private var tracksLoadAttempted = false
 
     private enum LibraryAddState {
         case idle, adding, added, failed(String)
@@ -145,6 +153,8 @@ struct AlbumView: View {
                 tagsRow
                 if !tracks.isEmpty {
                     tracklistSection
+                } else if !tracksLoadAttempted {
+                    tracklistSkeleton
                 }
                 Spacer(minLength: 0)
             }
@@ -346,6 +356,44 @@ struct AlbumView: View {
 
     // MARK: - Tracklist
 
+    /// Placeholder shown between view-appear and the first response from
+    /// MusicKit / the on-disk TrackCache. Without it, the album page renders
+    /// hero + actions + abrupt empty space until the network resolves, which
+    /// reads as a stalled load even though the rest of the page is interactive.
+    private var tracklistSkeleton: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Tracks")
+                .font(.headline)
+                .foregroundStyle(AppTheme.primaryText)
+
+            VStack(spacing: 0) {
+                ForEach(0..<6, id: \.self) { idx in
+                    HStack(spacing: 12) {
+                        Text("\(idx + 1)")
+                            .font(.footnote.monospacedDigit())
+                            .foregroundStyle(AppTheme.secondary.opacity(0.4))
+                            .frame(width: 22, alignment: .trailing)
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(AppTheme.elevatedSurface)
+                            .frame(height: 12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(AppTheme.elevatedSurface)
+                            .frame(width: 34, height: 10)
+                    }
+                    .padding(.vertical, 10)
+                    if idx < 5 { Divider().background(AppTheme.hairline) }
+                }
+            }
+            .padding(.horizontal, 14)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(AppTheme.surface))
+        }
+        .redacted(reason: .placeholder)
+        // Subtle pulse so the placeholder is read as "loading" rather than
+        // "this album has no tracks". opacity-only — no layout work.
+        .opacity(0.85)
+    }
+
     private var tracklistSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Section title only — the big play button at the top of the page
@@ -458,9 +506,17 @@ struct AlbumView: View {
     private func addSongButton(for track: AlbumTrackRow) -> some View {
         let isAdded = addedSongIDs.contains(track.id)
         let isAdding = addingSongIDs.contains(track.id)
-        if isAdded {
+        let justAdded = justAddedSongIDs.contains(track.id)
+        if isAdded && !justAdded {
             // Reserve the same width so track durations stay column-aligned.
             Color.clear.frame(width: 28, height: 28)
+        } else if justAdded {
+            Image(systemName: "checkmark")
+                .font(.footnote.weight(.bold))
+                .foregroundStyle(AppTheme.accent)
+                .frame(width: 28, height: 28)
+                .transition(.scale.combined(with: .opacity))
+                .accessibilityLabel("Added \(track.title)")
         } else {
             Button {
                 Task { await addSongToLibraryInline(track) }
@@ -524,7 +580,20 @@ struct AlbumView: View {
         defer { addingSongIDs.remove(track.id) }
         do {
             try await previewPlayer.addSongToLibrary(songID: track.id)
-            addedSongIDs.insert(track.id)
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.7)) {
+                addedSongIDs.insert(track.id)
+                justAddedSongIDs.insert(track.id)
+            }
+            // Hold the checkmark briefly so the user gets a positive confirmation,
+            // then fade to the transparent spacer so the row settles into its
+            // resting "already in library" state.
+            let trackID = track.id
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 1_400_000_000)
+                withAnimation(.easeOut(duration: 0.3)) {
+                    _ = justAddedSongIDs.remove(trackID)
+                }
+            }
         } catch {
             // On failure, leave the button in its idle state so the user can retry.
         }
@@ -533,6 +602,7 @@ struct AlbumView: View {
     @MainActor
     private func loadTracks() async {
         // Tracks are only fetchable via MusicKit (Apple Music). Spotify releases skip this.
+        defer { tracksLoadAttempted = true }
         guard releaseProvider == .appleMusic, let providerID = release?.providerID else { return }
 
         // Hot path: tracks were seeded in init from the cache, so just queue

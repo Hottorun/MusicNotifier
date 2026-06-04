@@ -13,7 +13,7 @@ import WidgetKit
 
 @main
 struct MusicNotifierApp: App {
-    @StateObject private var refreshCoordinator = RefreshCoordinator()
+    @State private var refreshCoordinator = RefreshCoordinator()
     @StateObject private var navigationDepth = TabNavigationDepth()
     @AppStorage(AppSettings.appearance) private var appearanceRaw: String = "system"
 
@@ -99,7 +99,7 @@ struct MusicNotifierApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(refreshCoordinator)
+                .environment(refreshCoordinator)
                 .environmentObject(navigationDepth)
                 .preferredColorScheme(preferredScheme)
                 .task {
@@ -118,6 +118,52 @@ struct MusicNotifierApp: App {
         .backgroundTask(.appRefresh(BackgroundRefreshScheduler.taskIdentifier)) {
             await BackgroundRefreshScheduler.handleAppRefresh(modelContainer: sharedModelContainer)
         }
+        // Reasonable starting window for Mac Catalyst — wide enough to hold the
+        // sidebar + a comfortable detail column without horizontal cramping.
+        .defaultSize(width: 1180, height: 760)
+        // Menu-bar items + ⌘ shortcuts for Mac / iPad hardware keyboards. We
+        // post Notifications instead of binding state across the Scene/App
+        // boundary; ContentView already listens and forwards to the same
+        // selection / refresh / settings paths the UI uses.
+        .commands {
+            CommandGroup(replacing: .newItem) {} // suppress unused "New Window"
+
+            // `replacing:` instead of `after:` — Catalyst auto-installs its
+            // own "MusicNotifier > Settings…" menu item bound to ⌘, and the
+            // `after:` variant *adds* a second one, which makes UIKit throw
+            // "Replacement elements contain duplicates" the moment a
+            // responder chain installs keyboard shortcuts (e.g. when the
+            // search sheet's text field comes up). `replacing:` swaps the
+            // platform default with our own action.
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") {
+                    NotificationCenter.default.post(name: .musicNotifierOpenSettings, object: nil)
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
+
+            CommandMenu("Go") {
+                Button("Feed") { selectTab(0) }
+                    .keyboardShortcut("1", modifiers: .command)
+                Button("Upcoming") { selectTab(1) }
+                    .keyboardShortcut("2", modifiers: .command)
+                Button("Artists") { selectTab(2) }
+                    .keyboardShortcut("3", modifiers: .command)
+                Button("Videos") { selectTab(3) }
+                    .keyboardShortcut("4", modifiers: .command)
+                Button("Concerts") { selectTab(4) }
+                    .keyboardShortcut("5", modifiers: .command)
+                Divider()
+                Button("Refresh") {
+                    NotificationCenter.default.post(name: .musicNotifierRequestRefresh, object: nil)
+                }
+                .keyboardShortcut("r", modifiers: .command)
+            }
+        }
+    }
+
+    private func selectTab(_ tag: Int) {
+        NotificationCenter.default.post(name: .musicNotifierSelectTab, object: tag)
     }
 }
 

@@ -17,7 +17,7 @@ import MusicKit
 /// Lightweight projection of a release used by playlist routing. Carries
 /// everything the rule engine needs (kind, artist genres) so the sync can
 /// run without re-fetching SwiftData.
-struct PlaylistSyncCandidate {
+struct PlaylistSyncCandidate: Sendable {
     let albumProviderID: String
     let kind: String
     let artistGenres: [String]

@@ -69,34 +69,32 @@ struct UpcomingView: View {
         UpcomingLayout(rawValue: layoutRaw) ?? .list
     }
 
-    private var upcomingReleases: [ReleaseData] {
-        let trackedIDs = Set(trackedArtists.map(\.providerID))
-        return storedReleases
-            .filter { release in
-                guard release.dismissedAt == nil else { return false }
-                guard trackedIDs.contains(release.artistProviderID) else { return false }
-                guard kindIsGloballyVisible(release.kind) else { return false }
-                return release.isUpcoming
-            }
-            .sorted { ($0.releaseDate ?? .distantFuture) < ($1.releaseDate ?? .distantFuture) }
+    /// Single-pass derivation. Previously `upcomingReleases` and `calendarReleases`
+    /// each walked the entire release table independently (and recomputed
+    /// `Set(trackedArtists.map…)` each time). With a few hundred releases that's
+    /// noticeable. Batched here into one walk per body render.
+    private struct UpcomingDerived {
+        var upcoming: [ReleaseData] = []
+        var calendar: [ReleaseData] = []
     }
 
-    /// Calendar-only feed: upcoming releases plus tracked-artist releases that
-    /// dropped within the past ~45 days. The recent ones render greyed-out on
-    /// past dates so the calendar reads as a continuous "what dropped / what's
-    /// coming" timeline rather than a forward-only schedule (TASK.md → "2-month
-    /// rolling calendar").
-    private var calendarReleases: [ReleaseData] {
+    private func makeUpcomingDerived() -> UpcomingDerived {
         let trackedIDs = Set(trackedArtists.map(\.providerID))
-        let cal = Calendar.current
-        let cutoff = cal.date(byAdding: .day, value: -45, to: Date()) ?? .distantPast
-        return storedReleases.filter { release in
-            guard release.dismissedAt == nil else { return false }
-            guard trackedIDs.contains(release.artistProviderID) else { return false }
-            guard kindIsGloballyVisible(release.kind) else { return false }
-            guard let date = release.releaseDate else { return false }
-            return release.isUpcoming || date >= cutoff
+        let cutoff = Calendar.current.date(byAdding: .day, value: -45, to: Date()) ?? .distantPast
+        var out = UpcomingDerived()
+        for release in storedReleases {
+            guard release.dismissedAt == nil else { continue }
+            guard trackedIDs.contains(release.artistProviderID) else { continue }
+            guard kindIsGloballyVisible(release.kind) else { continue }
+            if release.isUpcoming {
+                out.upcoming.append(release)
+                out.calendar.append(release)
+            } else if let date = release.releaseDate, date >= cutoff {
+                out.calendar.append(release)
+            }
         }
+        out.upcoming.sort { ($0.releaseDate ?? .distantFuture) < ($1.releaseDate ?? .distantFuture) }
+        return out
     }
 
     private func kindIsGloballyVisible(_ kind: ReleaseKind) -> Bool {
@@ -111,18 +109,19 @@ struct UpcomingView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        let derived = makeUpcomingDerived()
+        return NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    header
+                    headerView(upcomingCount: derived.upcoming.count)
 
-                    if upcomingReleases.isEmpty {
+                    if derived.upcoming.isEmpty {
                         emptyState
                     } else {
                         switch layout {
-                        case .list: listLayout
-                        case .grid: gridLayout
-                        case .calendar: calendarLayout
+                        case .list: listLayoutView(upcoming: derived.upcoming)
+                        case .grid: gridLayoutView(upcoming: derived.upcoming)
+                        case .calendar: calendarLayoutView(calendar: derived.calendar)
                         }
                     }
 
@@ -137,13 +136,8 @@ struct UpcomingView: View {
                 AlbumView(release: release)
             }
             .task {
-                // Pre-warm artwork covers so the upcoming feed renders without
-                // per-cell fades on first appearance.
-                ImagePrefetcher.prefetch(upcomingReleases.prefix(60).map(\.artworkURL))
-
-                // Same top-of-feed tracklist prefetch as HomeView so taps on
-                // the visible upcoming releases are already cache hits.
-                let topIDs = upcomingReleases.prefix(10).map(\.providerID)
+                ImagePrefetcher.prefetch(derived.upcoming.prefix(60).map(\.artworkURL))
+                let topIDs = derived.upcoming.prefix(10).map(\.providerID)
                 Task.detached(priority: .utility) {
                     await TrackPrefetcher.prefetchBatch(providerIDs: topIDs)
                 }
@@ -169,14 +163,14 @@ struct UpcomingView: View {
 
     // MARK: - Header
 
-    private var header: some View {
+    private func headerView(upcomingCount: Int) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Upcoming")
                 .font(.system(size: 36, weight: .bold, design: .rounded))
                 .foregroundStyle(AppTheme.primaryText)
 
             HStack(spacing: 8) {
-                inlineMetric(value: upcomingReleases.count, label: "upcoming", color: .white)
+                inlineMetric(value: upcomingCount, label: "upcoming", color: .white)
                 Spacer()
                 layoutToggle
             }
@@ -201,15 +195,16 @@ struct UpcomingView: View {
 
     private var layoutToggle: some View {
         Button {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                let next: UpcomingLayout = switch layout {
-                case .list: .grid
-                case .grid: .calendar
-                case .calendar: .list
-                }
-                layoutRaw = next.rawValue
-                if next == .calendar { selectedDay = nil }
+            // Same reasoning as Home.layoutToggleChip — animating the layout flip
+            // forces every visible upcoming row to re-position, which costs more
+            // than the visual reward of the crossfade.
+            let next: UpcomingLayout = switch layout {
+            case .list: .grid
+            case .grid: .calendar
+            case .calendar: .list
             }
+            layoutRaw = next.rawValue
+            if next == .calendar { selectedDay = nil }
         } label: {
             Image(systemName: layout.systemImage)
                 .font(.footnote.weight(.semibold))
@@ -223,8 +218,8 @@ struct UpcomingView: View {
 
     // MARK: - List layout
 
-    private var listLayout: some View {
-        ForEach(monthBuckets, id: \.label) { bucket in
+    private func listLayoutView(upcoming: [ReleaseData]) -> some View {
+        ForEach(monthBuckets(from: upcoming), id: \.label) { bucket in
             VStack(alignment: .leading, spacing: 10) {
                 SectionHeader(title: bucket.label)
                     .padding(.horizontal, 20)
@@ -243,9 +238,9 @@ struct UpcomingView: View {
 
     // MARK: - Grid layout
 
-    private var gridLayout: some View {
+    private func gridLayoutView(upcoming: [ReleaseData]) -> some View {
         let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
-        return ForEach(monthBuckets, id: \.label) { bucket in
+        return ForEach(monthBuckets(from: upcoming), id: \.label) { bucket in
             VStack(alignment: .leading, spacing: 10) {
                 SectionHeader(title: bucket.label)
                     .padding(.horizontal, 20)
@@ -264,7 +259,8 @@ struct UpcomingView: View {
 
     // MARK: - Calendar layout (rolling 2 months — direction set in Settings)
 
-    private var calendarLayout: some View {
+    private func calendarLayoutView(calendar: [ReleaseData]) -> some View {
+        let calReleases = calendar
         let cal = Calendar.current
         let thisMonth = cal.startOfMonth(for: Date())
         let direction = CalendarDirection(rawValue: calendarDirectionRaw) ?? .future
@@ -279,13 +275,15 @@ struct UpcomingView: View {
             }
         }()
 
+        let byDay = releasesByDay(from: calReleases)
+
         return VStack(spacing: 22) {
             ForEach(Array(months.enumerated()), id: \.offset) { _, month in
-                monthBlock(for: month)
+                monthBlock(for: month, byDay: byDay)
             }
 
             if let selectedDay {
-                let dayReleases = releasesByDay[cal.startOfDay(for: selectedDay)] ?? []
+                let dayReleases = byDay[cal.startOfDay(for: selectedDay)] ?? []
                 if !dayReleases.isEmpty {
                     VStack(alignment: .leading, spacing: 10) {
                         SectionHeader(title: selectedDay.formatted(.dateTime.weekday(.wide).day().month(.wide)))
@@ -306,12 +304,12 @@ struct UpcomingView: View {
         }
     }
 
-    private func monthBlock(for month: Date) -> some View {
+    private func monthBlock(for month: Date, byDay: [Date: [ReleaseData]]) -> some View {
         let cal = Calendar.current
         let isCurrentMonth = cal.isDate(month, equalTo: Date(), toGranularity: .month)
-        let cells = monthCells(for: month)
+        let cells = monthCells(for: month, byDay: byDay)
         let releaseCount = cells.compactMap { $0.date }.reduce(0) { acc, d in
-            acc + (releasesByDay[cal.startOfDay(for: d)]?.count ?? 0)
+            acc + (byDay[cal.startOfDay(for: d)]?.count ?? 0)
         }
         let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 7)
 
@@ -386,14 +384,14 @@ struct UpcomingView: View {
         return Array(symbols[firstIdx...]) + Array(symbols[..<firstIdx])
     }
 
-    private var releasesByDay: [Date: [ReleaseData]] {
+    private func releasesByDay(from source: [ReleaseData]) -> [Date: [ReleaseData]] {
         let cal = Calendar.current
-        return Dictionary(grouping: calendarReleases) { release -> Date in
+        return Dictionary(grouping: source) { release -> Date in
             cal.startOfDay(for: release.releaseDate ?? .distantFuture)
         }
     }
 
-    private func monthCells(for month: Date) -> [CalendarCellModel] {
+    private func monthCells(for month: Date, byDay: [Date: [ReleaseData]]) -> [CalendarCellModel] {
         let cal = Calendar.current
         let monthStart = cal.startOfMonth(for: month)
         let monthRange = cal.range(of: .day, in: .month, for: monthStart) ?? 1..<30
@@ -406,7 +404,7 @@ struct UpcomingView: View {
         for _ in 0..<leadingWeekdayOffset { cells.append(CalendarCellModel(date: nil, artworkURLs: [])) }
         for day in monthRange {
             guard let date = cal.date(byAdding: .day, value: day - 1, to: monthStart) else { continue }
-            let releases = releasesByDay[cal.startOfDay(for: date)] ?? []
+            let releases = byDay[cal.startOfDay(for: date)] ?? []
             cells.append(CalendarCellModel(
                 date: date,
                 artworkURLs: releases.prefix(3).compactMap(\.artworkURL)
@@ -451,9 +449,9 @@ struct UpcomingView: View {
         return f
     }()
 
-    private var monthBuckets: [MonthBucket] {
+    private func monthBuckets(from source: [ReleaseData]) -> [MonthBucket] {
         let formatter = Self.monthBucketFormatter
-        let grouped = Dictionary(grouping: upcomingReleases) { release -> String in
+        let grouped = Dictionary(grouping: source) { release -> String in
             guard let date = release.releaseDate else { return "Date unknown" }
             return formatter.string(from: date)
         }
@@ -582,49 +580,71 @@ private struct UpcomingRow: View {
     @Environment(\.modelContext) private var modelContext
 
     var body: some View {
-        HStack(spacing: 12) {
-            dateStamp
+        // Two-tier card. Top tier: date stamp, artwork, artist + title, then
+        // the calendar button hard against the right edge. Bottom tier:
+        // single inline metadata line "[icon] Album · 3 days" — gives both
+        // the kind and the countdown room without crowding the title.
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 12) {
+                dateStamp
 
-            CachedAsyncImage(url: release.artworkURL) {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(AppTheme.elevatedSurface)
-                    .overlay {
-                        Image(systemName: "music.note")
-                            .foregroundStyle(AppTheme.secondary)
-                    }
-            }
-            .frame(width: 56, height: 56)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(release.artistName.uppercased())
-                    .font(.caption2.weight(.semibold))
-                    .tracking(0.8)
-                    .foregroundStyle(AppTheme.secondary)
-                    .lineLimit(1)
-
-                Text(ReleaseTitleFormatter.displayTitle(release.title))
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
-                    .foregroundStyle(AppTheme.primaryText)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-
-                HStack(spacing: 6) {
-                    Text(release.type.uppercased())
-                        .font(.caption2.weight(.bold))
-                        .tracking(0.5)
-                        .foregroundStyle(AppTheme.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(AppTheme.elevatedSurface))
-                    if let date = release.releaseDate {
-                        InlineCountdown(date: date)
-                    }
+                CachedAsyncImage(url: release.artworkURL) {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(AppTheme.elevatedSurface)
+                        .overlay {
+                            Image(systemName: "music.note")
+                                .foregroundStyle(AppTheme.secondary)
+                        }
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(width: 56, height: 56)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            AddToCalendarButton(release: release)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(release.artistName.uppercased())
+                        .font(.caption2.weight(.semibold))
+                        .tracking(0.8)
+                        .foregroundStyle(AppTheme.accent)
+                        .lineLimit(1)
+
+                    Text(ReleaseTitleFormatter.displayTitle(release.title))
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppTheme.primaryText)
+                        // `reservesSpace: true` keeps the title slot two
+                        // lines tall regardless of how short the text is,
+                        // so every row has a uniform height instead of
+                        // jumping between one and two visual lines.
+                        .lineLimit(2, reservesSpace: true)
+                        .multilineTextAlignment(.leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                AddToCalendarButton(release: release)
+            }
+
+            // Bottom inline meta strip — two capsules: [type icon Album] [3 days].
+            HStack(spacing: 6) {
+                HStack(spacing: 4) {
+                    Image(systemName: typeIconName)
+                        .font(.caption2)
+                    Text(release.type.capitalized)
+                        .font(.caption.weight(.medium))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(AppTheme.elevatedSurface))
+                .foregroundStyle(AppTheme.secondary)
+
+                if let date = release.releaseDate {
+                    let imminent = isImminent(date: date)
+                    Text(countdownText(for: date))
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(imminent ? AppTheme.accent : AppTheme.elevatedSurface))
+                        .foregroundStyle(imminent ? .white : AppTheme.secondary)
+                }
+                Spacer(minLength: 0)
+            }
         }
         .padding(10)
         .padding(.trailing, 8)
@@ -657,6 +677,53 @@ private struct UpcomingRow: View {
                 Label("Dismiss", systemImage: "xmark")
             }
         }
+    }
+
+    /// SF Symbol used in the bottom meta strip to hint at the release kind.
+    /// Falls back to the disc icon for anything we don't have a dedicated
+    /// symbol for.
+    private var typeIconName: String {
+        switch ReleaseKind(rawValue: release.type) ?? .album {
+        case .album, .compilation, .liveAlbum: return "opticaldisc"
+        case .ep: return "square.stack"
+        case .single: return "music.note"
+        case .remix: return "waveform"
+        }
+    }
+
+    /// Mixed-case countdown string for the inline meta line. Same logic as
+    /// `InlineCountdown` but lower-cased to read as part of a sentence
+    /// ("Album · 3 days") instead of the standalone uppercase pill style.
+    /// "Imminent" = 0–7 days out (inclusive of today, exclusive of past).
+    /// Drives the red accent fill on the countdown pill so soon-to-drop
+    /// releases are scannable at a glance.
+    private func isImminent(date: Date) -> Bool {
+        let days = Calendar.current.dateComponents(
+            [.day],
+            from: Calendar.current.startOfDay(for: Date()),
+            to: Calendar.current.startOfDay(for: date)
+        ).day ?? 0
+        return days >= 0 && days <= 7
+    }
+
+    private func countdownText(for date: Date) -> String {
+        let days = Calendar.current.dateComponents(
+            [.day],
+            from: Calendar.current.startOfDay(for: Date()),
+            to: Calendar.current.startOfDay(for: date)
+        ).day ?? 0
+        if days < 0 {
+            let abs = -days
+            if abs == 1 { return "yesterday" }
+            if abs < 14 { return "\(abs) days ago" }
+            if abs < 60 { return "\(abs / 7) weeks ago" }
+            return "released"
+        }
+        if days == 0 { return "today" }
+        if days == 1 { return "tomorrow" }
+        if days < 14 { return "\(days) days" }
+        if days < 60 { return "\(days / 7) weeks" }
+        return "\(days / 30) months"
     }
 
     private var dateStamp: some View {
@@ -761,10 +828,15 @@ private struct InlineCountdown: View {
             Text(label(for: days))
                 .font(.caption2.weight(.bold))
                 .tracking(0.3)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
         }
         .foregroundStyle(imminent ? AppTheme.accent : AppTheme.secondary)
     }
 
+    /// Concise countdown labels. "IN " prefix dropped because it pushes the
+    /// label onto a second line in narrow grid cells; "3 DAYS" or "7 WEEKS"
+    /// reads the same and always fits on one line.
     private func label(for days: Int) -> String {
         if days < 0 {
             let abs = -days
@@ -775,9 +847,9 @@ private struct InlineCountdown: View {
         }
         if days == 0 { return "TODAY" }
         if days == 1 { return "TOMORROW" }
-        if days < 14 { return "IN \(days) DAYS" }
-        if days < 60 { return "IN \(days / 7) WEEKS" }
-        return "IN \(days / 30) MONTHS"
+        if days < 14 { return "\(days) DAYS" }
+        if days < 60 { return "\(days / 7) WEEKS" }
+        return "\(days / 30) MONTHS"
     }
 }
 

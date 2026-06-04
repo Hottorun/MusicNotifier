@@ -60,40 +60,58 @@ struct AppleMusicVideoService {
         var collected: [FetchedVideo] = []
         var seenIDs: Set<String> = []
 
-        // Per-artist music videos (sequential with light concurrency to avoid 429).
-        await withTaskGroup(of: [FetchedVideo].self) { group in
-            let maxConcurrent = 3
-            var index = 0
+        // Per-artist music videos AND the interview search pass run concurrently —
+        // they hit independent endpoints so there's no reason to serialize them.
+        async let perArtistTask: [FetchedVideo] = {
+            var local: [FetchedVideo] = []
+            var localSeen: Set<String> = []
+            await withTaskGroup(of: [FetchedVideo].self) { group in
+                let maxConcurrent = 4
+                var index = 0
 
-            func enqueue(_ i: Int) {
-                let input = appleInputs[i]
-                group.addTask {
-                    await self.fetchArtistVideos(input)
+                func enqueue(_ i: Int) {
+                    let input = appleInputs[i]
+                    group.addTask {
+                        await self.fetchArtistVideos(input)
+                    }
                 }
-            }
 
-            while index < min(maxConcurrent, appleInputs.count) {
-                enqueue(index)
-                index += 1
-            }
-
-            while let batch = await group.next() {
-                if Task.isCancelled { break }
-                for video in batch where !seenIDs.contains(video.providerID) {
-                    seenIDs.insert(video.providerID)
-                    collected.append(video)
-                }
-                if index < appleInputs.count && !Task.isCancelled {
+                while index < min(maxConcurrent, appleInputs.count) {
                     enqueue(index)
                     index += 1
                 }
-            }
-        }
 
-        // Interview pass — small set of catalog searches, filtered by tracked names.
+                while let batch = await group.next() {
+                    if Task.isCancelled { break }
+                    for video in batch where !localSeen.contains(video.providerID) {
+                        localSeen.insert(video.providerID)
+                        local.append(video)
+                    }
+                    if index < appleInputs.count && !Task.isCancelled {
+                        enqueue(index)
+                        index += 1
+                    }
+                }
+            }
+            return local
+        }()
+
         let trackedNames = appleInputs.map { ($0.providerID, $0.name) }
-        let interviewMatches = await fetchInterviewMatches(trackedArtists: trackedNames)
-        for video in interviewMatches where !seenIDs.contains(video.providerID) {
+        // Opt-in: interview discovery costs 4 extra catalog searches. Users who
+        // don't want their feed cluttered with Zane Lowe clips can keep it off
+        // and the refresh runs that much faster.
+        let includeInterviews = UserDefaults.standard.object(forKey: AppSettings.includeInterviewVideos) as? Bool ?? false
+        async let interviewTask: [FetchedVideo] = includeInterviews
+            ? self.fetchInterviewMatches(trackedArtists: trackedNames)
+            : []
+
+        let (perArtist, interviews) = await (perArtistTask, interviewTask)
+
+        for video in perArtist where !seenIDs.contains(video.providerID) {
+            seenIDs.insert(video.providerID)
+            collected.append(video)
+        }
+        for video in interviews where !seenIDs.contains(video.providerID) {
             seenIDs.insert(video.providerID)
             collected.append(video)
         }
@@ -141,38 +159,66 @@ struct AppleMusicVideoService {
         let lookup: [(providerID: String, name: String, lowered: String)] = trackedArtists.map {
             ($0.providerID, $0.name, $0.name.lowercased())
         }
+        // Fire all 4 catalog searches in parallel — they're independent and previously
+        // ran back-to-back (the dominant cost in the videos tail). Each task returns
+        // a list of (videoID, MusicVideo); we then dedupe + match against tracked names
+        // sequentially on the gathered union.
+        let terms = interviewSearchTerms
+        struct CandidateBatch: Sendable {
+            let items: [(id: String, title: String, artistName: String, artworkURL: URL?, videoURL: URL?, releaseDate: Date?, durationMs: Int?)]
+        }
+
+        let batches = await withTaskGroup(of: CandidateBatch.self) { group -> [CandidateBatch] in
+            for term in terms {
+                group.addTask {
+                    do {
+                        var request = MusicCatalogSearchRequest(term: term, types: [MusicVideo.self])
+                        request.limit = 25
+                        let response = try await request.response()
+                        let items = response.musicVideos.map { mv in
+                            (id: mv.id.rawValue,
+                             title: mv.title,
+                             artistName: mv.artistName,
+                             artworkURL: mv.artwork?.url(width: 600, height: 600),
+                             videoURL: mv.url,
+                             releaseDate: mv.releaseDate,
+                             durationMs: mv.duration.map { Int($0 * 1000) })
+                        }
+                        return CandidateBatch(items: items)
+                    } catch {
+                        Log.v("AppleMusicVideoService.fetchInterviewMatches(\(term)) failed: \(error)")
+                        return CandidateBatch(items: [])
+                    }
+                }
+            }
+            var collected: [CandidateBatch] = []
+            for await batch in group { collected.append(batch) }
+            return collected
+        }
+
         var collected: [FetchedVideo] = []
         var seen: Set<String> = []
-
-        for term in interviewSearchTerms {
-            if Task.isCancelled { break }
-            do {
-                var request = MusicCatalogSearchRequest(term: term, types: [MusicVideo.self])
-                request.limit = 25
-                let response = try await request.response()
-                for mv in response.musicVideos {
-                    if seen.contains(mv.id.rawValue) { continue }
-                    let titleLower = mv.title.lowercased()
-                    let artistLower = mv.artistName.lowercased()
-                    guard let match = lookup.first(where: {
-                        titleLower.contains($0.lowered) || artistLower.contains($0.lowered)
-                    }) else { continue }
-                    seen.insert(mv.id.rawValue)
-                    collected.append(FetchedVideo(
-                        providerID: mv.id.rawValue,
-                        artistProviderID: match.providerID,
-                        artistName: match.name,
-                        title: mv.title,
-                        kind: .interview,
-                        sourceName: mv.artistName,
-                        artworkURL: mv.artwork?.url(width: 600, height: 600),
-                        videoURL: mv.url,
-                        releaseDate: mv.releaseDate,
-                        durationMs: mv.duration.map { Int($0 * 1000) }
-                    ))
-                }
-            } catch {
-                Log.v("AppleMusicVideoService.fetchInterviewMatches(\(term)) failed: \(error)")
+        for batch in batches {
+            for item in batch.items {
+                if seen.contains(item.id) { continue }
+                let titleLower = item.title.lowercased()
+                let artistLower = item.artistName.lowercased()
+                guard let match = lookup.first(where: {
+                    titleLower.contains($0.lowered) || artistLower.contains($0.lowered)
+                }) else { continue }
+                seen.insert(item.id)
+                collected.append(FetchedVideo(
+                    providerID: item.id,
+                    artistProviderID: match.providerID,
+                    artistName: match.name,
+                    title: item.title,
+                    kind: .interview,
+                    sourceName: item.artistName,
+                    artworkURL: item.artworkURL,
+                    videoURL: item.videoURL,
+                    releaseDate: item.releaseDate,
+                    durationMs: item.durationMs
+                ))
             }
         }
         return collected

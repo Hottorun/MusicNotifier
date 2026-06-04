@@ -37,7 +37,7 @@ private enum PreAlertOption: Int, CaseIterable, Identifiable {
 struct SettingsView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var refreshCoordinator: RefreshCoordinator
+    @Environment(RefreshCoordinator.self) private var refreshCoordinator
     @AppStorage(AppSettings.autoRefreshOnLaunch) private var autoRefreshOnLaunch = true
     @AppStorage(AppSettings.releaseNotificationHour) private var releaseNotificationHour = 8
     @AppStorage(AppSettings.releaseNotificationMinute) private var releaseNotificationMinute = 0
@@ -64,6 +64,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.swipeBetweenTabs) private var swipeBetweenTabs: Bool = true
     @AppStorage(AppSettings.enableVideosTab) private var enableVideosTab: Bool = false
     @AppStorage(AppSettings.videoNotificationsEnabled) private var videoNotificationsEnabled: Bool = false
+    @AppStorage(AppSettings.includeInterviewVideos) private var includeInterviewVideos: Bool = false
     @AppStorage(AppSettings.upcomingCalendarDirection) private var calendarDirectionRaw: String = CalendarDirection.future.rawValue
     @AppStorage(AppSettings.enableConcertsTab) private var enableConcertsTab: Bool = false
     @AppStorage(AppSettings.useLocationForNearby) private var useLocationForNearby: Bool = false
@@ -471,6 +472,8 @@ struct SettingsView: View {
                 if enableVideosTab {
                     settingsDivider
                     settingsToggle("Notify for new videos", isOn: $videoNotificationsEnabled)
+                    settingsDivider
+                    settingsToggle("Include interviews & sessions", isOn: $includeInterviewVideos)
                 }
             }
             .background(
@@ -478,7 +481,7 @@ struct SettingsView: View {
             )
             .padding(.horizontal, 20)
 
-            Text("Pulls music videos from Apple Music for tracked artists, plus interviews from shows like Zane Lowe / Apple Music Sessions that mention them.")
+            Text("Pulls music videos from Apple Music for tracked artists. Interviews (Zane Lowe / Apple Music Sessions) are slower to fetch — leave that toggle off to keep refresh quick.")
                 .font(.caption)
                 .foregroundStyle(AppTheme.secondary)
                 .padding(.horizontal, 24)

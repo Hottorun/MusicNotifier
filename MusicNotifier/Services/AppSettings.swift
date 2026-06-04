@@ -73,6 +73,10 @@ enum AppSettings {
     /// interview. Only fires when `enableVideosTab` and `notificationsEnabled`
     /// are both true.
     static let videoNotificationsEnabled = "videoNotificationsEnabled"
+    /// When true, the videos pass also runs the (slower) interview-style catalog
+    /// searches. Defaults to false — interview discovery requires 4 extra catalog
+    /// searches that meaningfully extend the refresh wall-clock time.
+    static let includeInterviewVideos = "includeInterviewVideos"
     /// Which two months the Upcoming calendar shows. `"future"` = current +
     /// next (default — matches the tab's name). `"past"` = previous + current.
     static let upcomingCalendarDirection = "upcomingCalendarDirection"

@@ -318,6 +318,14 @@ struct AppleMusicReleaseService {
 
     private func mapAlbums(_ albums: [Album], artistProviderID: String) -> [FetchedRelease] {
         albums.compactMap { album in
+            // Skip promotional / placeholder catalog rows MusicKit occasionally
+            // hands back with an empty id — they trigger the noisy
+            // "No catalogID, libraryID, or deviceLocalID was found from
+            // underlying identifier set <MPIdentifierSet EMPTY>" log line
+            // and never resolve to a real album anyway.
+            let rawID = album.id.rawValue
+            guard !rawID.isEmpty else { return nil }
+
             let releaseDate = album.releaseDate
             if let releaseDate {
                 let daysFromRelease = Calendar.current.dateComponents([.day], from: releaseDate, to: Date()).day ?? 0
@@ -325,7 +333,7 @@ struct AppleMusicReleaseService {
             }
 
             return FetchedRelease(
-                providerID: album.id.rawValue,
+                providerID: rawID,
                 artistProviderID: artistProviderID,
                 artistName: album.artistName,
                 title: album.title,

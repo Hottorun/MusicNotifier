@@ -79,6 +79,21 @@ struct Artists: View {
     @State private var importMessage: String?
     @State private var showingImportSheet = false
     @State private var showingSearchSheet = false
+    /// IDs (artist providerID / label providerID) imported during this search
+    /// session — used to flash a checkmark on the +/✓ button so the user gets
+    /// an immediate confirmation that the add succeeded.
+    @State private var justImportedSearchIDs: Set<String> = []
+    /// Owns the in-flight search task so each keystroke can cancel the
+    /// previous one instead of spawning N parallel network calls.
+    @State private var searchTask: Task<Void, Never>?
+    @FocusState private var searchFieldFocused: Bool
+    /// Controls the custom inline search field's visibility. Hidden by
+    /// default; flipped by the toolbar magnifying-glass button. The standard
+    /// `.searchable` modifier was replaced because its built-in
+    /// pull-to-reveal at the top of a scroll surface can't be opted out of,
+    /// and that was making the search bar pop in unintentionally.
+    @State private var artistSearchFieldShown = false
+    @FocusState private var artistListSearchFocused: Bool
     @State private var selectedGenre: String? = nil
     @State private var scrubLetter: String? = nil
     @State private var lastScrubIndex: Int? = nil
@@ -128,11 +143,17 @@ struct Artists: View {
         }
     }
 
-    /// Distinct, alpha-sorted genres present in the user's library — populated
-    /// from Apple Music catalog data during the artwork backfill.
-    private var availableGenres: [String] {
-        let all = artists.flatMap { $0.genres ?? [] }
-        return Array(Set(all)).sorted()
+    /// Memoized: previously computed-per-access, which walked all artists × all
+    /// genres on every render (filterRow re-evaluates often when toggles change).
+    @State private var availableGenres: [String] = []
+
+    private func refreshAvailableGenres() {
+        var set: Set<String> = []
+        for artist in artists {
+            if let g = artist.genres { for v in g { set.insert(v) } }
+        }
+        let sorted = set.sorted()
+        if sorted != availableGenres { availableGenres = sorted }
     }
 
     private var visibleArtists: [ArtistData] {
@@ -166,29 +187,29 @@ struct Artists: View {
             }
     }
 
-    /// Letters represented in the current visible-artists list, in order.
-    /// Used to drive the trailing A-Z scrubber.
-    private var sectionLetters: [String] {
-        var seen: [String] = []
-        var inSet: Set<String> = []
-        for artist in visibleArtists {
-            let key = letterKey(for: artist.name)
-            if !inSet.contains(key) {
-                seen.append(key)
-                inSet.insert(key)
-            }
-        }
-        return seen
+    /// Memoized snapshot computed once per body render. Hot computed properties
+    /// (`visibleArtists`, `sectionLetters`, `letterIndex`) used to each walk the
+    /// full artist list independently; this batches them into a single pass.
+    private struct ArtistsSnapshot {
+        let visible: [ArtistData]
+        let sectionLetters: [String]
+        let letterIndex: [String: String]
     }
 
-    /// First artist's providerID for each letter, so we know where to scroll.
-    private var letterIndex: [String: String] {
-        var map: [String: String] = [:]
-        for artist in visibleArtists {
+    private func makeSnapshot() -> ArtistsSnapshot {
+        let visible = visibleArtists
+        var letters: [String] = []
+        var lettersSet: Set<String> = []
+        var index: [String: String] = [:]
+        for artist in visible {
             let key = letterKey(for: artist.name)
-            if map[key] == nil { map[key] = artist.providerID }
+            if !lettersSet.contains(key) {
+                lettersSet.insert(key)
+                letters.append(key)
+            }
+            if index[key] == nil { index[key] = artist.providerID }
         }
-        return map
+        return ArtistsSnapshot(visible: visible, sectionLetters: letters, letterIndex: index)
     }
 
     private func letterKey(for name: String) -> String {
@@ -199,15 +220,16 @@ struct Artists: View {
     }
 
     var body: some View {
-        NavigationStack {
+        let snapshot = makeSnapshot()
+        return NavigationStack {
             ScrollViewReader { scrollProxy in
                 ZStack(alignment: .trailing) {
-                    listBody(scrollProxy: scrollProxy)
+                    listBody(scrollProxy: scrollProxy, snapshot: snapshot)
                     // Scrubber is only meaningful in list mode — in grid mode every
                     // tile lives inside a single List row, so scrollProxy.scrollTo
                     // can't reach interior items.
-                    if artistsLayoutRaw != "grid" && sortOption == .name && visibleArtists.count > 50 {
-                        scrubber(scrollProxy: scrollProxy)
+                    if artistsLayoutRaw != "grid" && sortOption == .name && snapshot.visible.count > 50 {
+                        scrubber(scrollProxy: scrollProxy, snapshot: snapshot)
                     }
                 }
             }
@@ -223,8 +245,9 @@ struct Artists: View {
     /// jumps the list there; dragging up/down continuously updates as the
     /// finger crosses letter boundaries, with a haptic tap on each change and
     /// a floating HUD showing the current letter.
-    private func scrubber(scrollProxy: ScrollViewProxy) -> some View {
-        let letters = sectionLetters
+    private func scrubber(scrollProxy: ScrollViewProxy, snapshot: ArtistsSnapshot) -> some View {
+        let letters = snapshot.sectionLetters
+        let letterIndex = snapshot.letterIndex
         let letterHeight: CGFloat = 14
         return VStack(spacing: 0) {
             ForEach(Array(letters.enumerated()), id: \.offset) { _, letter in
@@ -287,10 +310,15 @@ struct Artists: View {
         .animation(.easeOut(duration: 0.15), value: scrubLetter)
     }
 
-    private func listBody(scrollProxy: ScrollViewProxy) -> some View {
-            List {
+    private func listBody(scrollProxy: ScrollViewProxy, snapshot: ArtistsSnapshot) -> some View {
+            let visibleArtists = snapshot.visible
+            return List {
                 Group {
                     header
+                    if artistSearchFieldShown {
+                        inlineArtistSearchField
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
                     filterRow
                     genreBulkActionBar
 
@@ -314,7 +342,7 @@ struct Artists: View {
                 } else {
                     if artistsLayoutRaw == "grid" {
                         // Single List row containing a 3-column grid of artist tiles.
-                        artistsGrid
+                        artistsGrid(visibleArtists: visibleArtists)
                             .listRowBackground(Color.clear)
                             .listRowSeparator(.hidden)
                             .listRowInsets(EdgeInsets(top: 6, leading: 18, bottom: 6, trailing: 18))
@@ -329,7 +357,7 @@ struct Artists: View {
                                 .listRowBackground(Color.clear)
                                 .listRowSeparator(.hidden)
                                 .listRowInsets(EdgeInsets(top: 3, leading: 18, bottom: 3, trailing: 18))
-                                .contextMenu { artistContextMenu(artist) }
+                                .contextMenu { artistContextMenu(artist) } preview: { artistContextMenuPreview(artist) }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                                     Button(role: .destructive) {
                                         deleteArtist(artist)
@@ -359,28 +387,51 @@ struct Artists: View {
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .appScreenBackground()
-            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search artists")
+            // `.searchable` was removed — see `inlineArtistSearchField` below.
+            // SwiftUI's searchable installs a pull-to-reveal gesture on the
+            // surrounding scroll surface that can't be disabled; users were
+            // tripping it by overscrolling at the top of the list.
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
+                    HStack(spacing: 12) {
                         Button {
-                            showingImportSheet = true
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                                artistSearchFieldShown.toggle()
+                            }
+                            if !artistSearchFieldShown {
+                                searchText = ""
+                                artistListSearchFocused = false
+                            }
+                            // Focus is requested by the field's own `.onAppear`.
                         } label: {
-                            Label("Import from \(selectedMusicProvider)", systemImage: "square.and.arrow.down")
+                            Image(systemName: "magnifyingglass")
+                                .font(.headline.weight(.semibold))
+                                .foregroundStyle(artistSearchFieldShown ? AppTheme.accent : AppTheme.primaryText)
                         }
-                        Button {
-                            showingSearchSheet = true
+                        .accessibilityLabel(artistSearchFieldShown ? "Hide search" : "Search artists")
+
+                        Menu {
+                            Button {
+                                showingImportSheet = true
+                            } label: {
+                                Label("Import from \(selectedMusicProvider)", systemImage: "square.and.arrow.down")
+                            }
+                            Button {
+                                showingSearchSheet = true
+                            } label: {
+                                Label("Add artist or label", systemImage: "magnifyingglass")
+                            }
                         } label: {
-                            Label("Add artist or label", systemImage: "magnifyingglass")
+                            Image(systemName: "plus")
+                                .font(.headline.weight(.semibold))
+                                .foregroundStyle(AppTheme.primaryText)
                         }
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.headline.weight(.semibold))
-                            .foregroundStyle(AppTheme.primaryText)
+                        .accessibilityLabel("Add artists")
                     }
-                    .accessibilityLabel("Add artists")
                 }
             }
+            .onAppear { refreshAvailableGenres() }
+            .onChange(of: artists.count) { _, _ in refreshAvailableGenres() }
             .task {
                 // Warm the on-screen artist artwork cache up-front so list/grid
                 // scrolling paints instantly instead of fading in per-row.
@@ -414,6 +465,46 @@ struct Artists: View {
                 .background(Capsule().fill(AppTheme.surface))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 18)
+    }
+
+    /// Inline search bar rendered as a List row when the user taps the
+    /// toolbar magnifier. Replaces `.searchable` here for the same reason as
+    /// HomeView — to remove SwiftUI's pull-down-at-top auto-reveal.
+    private var inlineArtistSearchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AppTheme.secondary)
+            TextField("Search artists", text: $searchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .foregroundStyle(AppTheme.primaryText)
+                .focused($artistListSearchFocused)
+                .submitLabel(.search)
+                .onAppear { artistListSearchFocused = true }
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(AppTheme.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            Button("Cancel") {
+                searchText = ""
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                    artistSearchFieldShown = false
+                }
+                artistListSearchFocused = false
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(AppTheme.accent)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 40)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(AppTheme.surface))
         .padding(.horizontal, 18)
     }
 
@@ -504,9 +595,10 @@ struct Artists: View {
             }
 
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    artistsLayoutRaw = (artistsLayoutRaw == "grid" ? "list" : "grid")
-                }
+                // Drop the animation: flipping the layout makes every artist row /
+                // tile re-position, which the system-default transition handles fine
+                // without an explicit eased timing that the whole list has to follow.
+                artistsLayoutRaw = (artistsLayoutRaw == "grid" ? "list" : "grid")
             } label: {
                 Image(systemName: artistsLayoutRaw == "grid" ? "square.grid.3x3.fill" : "list.bullet")
                     .font(.subheadline.weight(.semibold))
@@ -543,7 +635,7 @@ struct Artists: View {
         .padding(.horizontal, 18)
     }
 
-    private var artistsGrid: some View {
+    private func artistsGrid(visibleArtists: [ArtistData]) -> some View {
         let columns = [
             GridItem(.flexible(), spacing: 10),
             GridItem(.flexible(), spacing: 10),
@@ -553,15 +645,46 @@ struct Artists: View {
         let summaries = artistSummaries
         return LazyVGrid(columns: columns, spacing: 14) {
             ForEach(visibleArtists, id: \.providerID) { artist in
-                Button {
-                    gridSelectedArtist = artist
-                } label: {
-                    artistGridTile(artist, summary: summaries[artist.providerID])
-                }
-                .buttonStyle(.plain)
-                .contextMenu { artistContextMenu(artist) }
+                // Each cell lives in its own struct so SwiftUI gives it a
+                // stable identity. Inlining the tile + Button + contextMenu
+                // in a ForEach inside LazyVGrid leaks identity across cells —
+                // long-press always lifts the first artist, and tap-target
+                // hit testing gets confused. Extracting to ArtistGridCell
+                // fixes both at once.
+                ArtistGridCell(
+                    onSelect: { gridSelectedArtist = artist },
+                    tile: { artistGridTile(artist, summary: summaries[artist.providerID]) },
+                    menu: { artistContextMenu(artist) },
+                    preview: { artistContextMenuPreview(artist) }
+                )
             }
         }
+    }
+
+    /// Lightweight long-press snapshot — artwork + name, nothing else. The
+    /// default snapshot would lift the entire list row including ring overlays
+    /// and metadata badges, which sometimes stutters on first present.
+    private func artistContextMenuPreview(_ artist: ArtistData) -> some View {
+        VStack(spacing: 14) {
+            CachedAsyncImage(url: artist.artworkURL) {
+                Circle().fill(AppTheme.elevatedSurface)
+                    .overlay {
+                        Image(systemName: "person.fill")
+                            .font(.system(size: 36, weight: .light))
+                            .foregroundStyle(AppTheme.secondary)
+                    }
+            }
+            .frame(width: 180, height: 180)
+            .clipShape(Circle())
+
+            Text(artist.name)
+                .font(.headline)
+                .foregroundStyle(AppTheme.primaryText)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+        }
+        .padding(20)
+        .background(AppTheme.surface)
     }
 
     /// Long-press menu for artist tiles and rows. Mirrors the MusicHarbor
@@ -1028,6 +1151,7 @@ struct Artists: View {
                             .textInputAutocapitalization(.words)
                             .autocorrectionDisabled()
                             .foregroundStyle(AppTheme.primaryText)
+                            .focused($searchFieldFocused)
                         if isSearching {
                             ProgressView().scaleEffect(0.8)
                         } else if !artistSearchTerm.isEmpty {
@@ -1048,6 +1172,14 @@ struct Artists: View {
                         Text("No matches")
                             .font(.footnote)
                             .foregroundStyle(AppTheme.secondary)
+                    }
+
+                    // When the field is empty, fill the empty area below the
+                    // search bar with the Discover carousel so the sheet
+                    // doesn't read as a blank page. Hidden the moment the
+                    // user starts typing so it doesn't compete with results.
+                    if artistSearchTerm.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        searchSheetDiscoverySection
                     }
 
                     // Labels first — there are usually fewer and they're easier to find.
@@ -1076,8 +1208,66 @@ struct Artists: View {
                 }
             }
             .onChange(of: artistSearchTerm) { _, newValue in
-                Task { await debouncedCombinedSearch(term: newValue) }
+                // Cancel the previous search task so a stream of keystrokes
+                // doesn't accumulate N in-flight network calls — previously
+                // every character spawned a fresh Task that all woke up
+                // after their respective debounces and raced.
+                searchTask?.cancel()
+                searchTask = Task { await debouncedCombinedSearch(term: newValue) }
             }
+            .task {
+                // Auto-focus on first present. Without the brief delay the
+                // sheet's slide-in animation can outrun the keyboard, leaving
+                // it half-presented behind the sheet.
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                searchFieldFocused = true
+            }
+            .task {
+                // Lazy-load Discover suggestions so the sheet has content
+                // below the search bar from the moment it opens.
+                if discoverySuggestions.isEmpty && !isLoadingDiscovery {
+                    await loadDiscoverySuggestions()
+                }
+            }
+        }
+    }
+
+    /// Discover carousel surfaced inside the Add sheet when the user hasn't
+    /// typed anything yet. Mirrors the carousel on the main Artists tab but
+    /// renders the cards in a vertical grid so they fill the empty space
+    /// below the search bar instead of forcing horizontal scrolling.
+    @ViewBuilder
+    private var searchSheetDiscoverySection: some View {
+        if !discoverySuggestions.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(AppTheme.accent)
+                    Text("Discover")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(AppTheme.primaryText)
+                    Spacer()
+                    Text("Based on artists you track")
+                        .font(.caption2)
+                        .foregroundStyle(AppTheme.secondary)
+                }
+                let columns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
+                LazyVGrid(columns: columns, spacing: 10) {
+                    ForEach(discoverySuggestions) { suggestion in
+                        discoveryCard(suggestion: suggestion)
+                    }
+                }
+            }
+            .padding(.top, 4)
+        } else if isLoadingDiscovery {
+            HStack(spacing: 8) {
+                ProgressView().tint(AppTheme.accent).scaleEffect(0.8)
+                Text("Finding similar artists…")
+                    .font(.footnote)
+                    .foregroundStyle(AppTheme.secondary)
+            }
+            .padding(.top, 4)
         }
     }
 
@@ -1106,17 +1296,13 @@ struct Artists: View {
 
             Spacer()
 
-            Button {
+            searchAddButton(
+                isImported: artists.contains { $0.providerID == label.id },
+                isJustAdded: justImportedSearchIDs.contains(label.id),
+                accessibilityLabel: "Follow \(label.name)"
+            ) {
                 importSearchedLabel(label)
-            } label: {
-                Image(systemName: "plus")
-                    .font(.subheadline.weight(.bold))
-                    .frame(width: 32, height: 32)
-                    .background(Circle().fill(AppTheme.accentSoft))
-                    .foregroundStyle(AppTheme.accent)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Follow \(label.name)")
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(AppTheme.surface))
@@ -1141,24 +1327,57 @@ struct Artists: View {
 
             Spacer()
 
-            Button {
+            searchAddButton(
+                isImported: artists.contains { $0.providerID == artist.id },
+                isJustAdded: justImportedSearchIDs.contains(artist.id),
+                accessibilityLabel: "Import \(artist.name)"
+            ) {
                 importSearchedArtist(artist)
-            } label: {
-                Image(systemName: "plus")
-                    .font(.subheadline.weight(.bold))
-                    .frame(width: 32, height: 32)
-                    .background(Circle().fill(AppTheme.accentSoft))
-                    .foregroundStyle(AppTheme.accent)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Import \(artist.name)")
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(AppTheme.surface))
     }
 
-    /// Debounced combined search. Cancels any in-flight task, waits 300ms after
-    /// the last keystroke, then runs artist + label lookups in parallel.
+    /// Shared +/✓ control for the search sheet's artist and label rows. Shows
+    /// a green check for anyone the user has already imported (so they can scan
+    /// results at a glance) and briefly flashes the check on a fresh tap before
+    /// settling into the "already tracked" state.
+    @ViewBuilder
+    private func searchAddButton(
+        isImported: Bool,
+        isJustAdded: Bool,
+        accessibilityLabel: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        let showCheck = isImported || isJustAdded
+        Button(action: {
+            guard !isImported else { return }
+            action()
+        }) {
+            // `.contentTransition(.symbolEffect(.replace))` lived here briefly
+            // and caused a runtime crash the first time the parent re-rendered
+            // during search typing on at least one device — the symbol-replace
+            // transition appears to be unhappy with this particular Button +
+            // disabled + animated-scale combination. A plain crossfade via the
+            // surrounding withAnimation in `flashJustAdded` is sufficient.
+            Image(systemName: showCheck ? "checkmark" : "plus")
+                .font(.subheadline.weight(.bold))
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(showCheck ? AppTheme.accent : AppTheme.accentSoft))
+                .foregroundStyle(showCheck ? .white : AppTheme.accent)
+                .scaleEffect(isJustAdded ? 1.08 : 1.0)
+                .animation(.spring(response: 0.3, dampingFraction: 0.6), value: isJustAdded)
+        }
+        .buttonStyle(.plain)
+        .disabled(isImported)
+        .accessibilityLabel(isImported ? "Already following" : accessibilityLabel)
+    }
+
+    /// Debounced combined search. The owning `searchTask` State cancels the
+    /// previous task on each new keystroke, so this throws-on-cancel `sleep`
+    /// is the bail-out for stale typing; only the final keystroke survives
+    /// the wait to fire network calls.
     @MainActor
     private func debouncedCombinedSearch(term: String) async {
         let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1167,10 +1386,11 @@ struct Artists: View {
             labelSearchResults = []
             return
         }
-        // 300ms debounce
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        // If the term changed during the sleep, abandon — a newer search will run.
-        guard trimmed == artistSearchTerm.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+        // 200ms feels responsive without spamming the catalog endpoint.
+        // Throwing variant so cancellation by the next keystroke aborts here
+        // instead of falling through to a network call.
+        do { try await Task.sleep(nanoseconds: 200_000_000) } catch { return }
+        if Task.isCancelled { return }
 
         isSearching = true
         defer { isSearching = false }
@@ -1178,6 +1398,7 @@ struct Artists: View {
         async let artists = (try? await searchArtistsForCombined(trimmed)) ?? []
         async let labels = (try? await AppleMusicLibraryImportService().searchCatalogLabels(term: trimmed)) ?? []
         let (a, l) = await (artists, labels)
+        if Task.isCancelled { return }
 
         artistSearchResults = a
         labelSearchResults = l.map { LabelSearchResult(id: $0.id.rawValue, name: $0.name, artworkURL: $0.artwork?.url(width: 200, height: 200)) }
@@ -1312,7 +1533,7 @@ struct Artists: View {
                 }
                 try AppleMusicLibraryImportService().importLabel(match, into: modelContext)
                 importMessage = "Now following \(label.name)."
-                labelSearchResults.removeAll { $0.id == label.id }
+                flashJustAdded(label.id)
             } catch {
                 importMessage = "Couldn't follow \(label.name): \(error.localizedDescription)"
             }
@@ -1355,8 +1576,25 @@ struct Artists: View {
                 try SpotifyService().importArtist(artist, into: modelContext)
             }
             importMessage = "Imported and tracking \(artist.name)."
+            flashJustAdded(artist.id)
         } catch {
             importMessage = "Could not import \(artist.name): \(error.localizedDescription)"
+        }
+    }
+
+    /// Briefly mark a search-result row as freshly added so the +/✓ button
+    /// animates from plus to check. After ~1.4s the flag clears; from that
+    /// point the check stays because the artist/label is now in `artists` and
+    /// `isImported` is true on its own.
+    private func flashJustAdded(_ id: String) {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+            _ = justImportedSearchIDs.insert(id)
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_400_000_000)
+            withAnimation(.easeOut(duration: 0.25)) {
+                _ = justImportedSearchIDs.remove(id)
+            }
         }
     }
 
@@ -1454,4 +1692,24 @@ struct Artists: View {
 #Preview {
     Artists()
         .modelContainer(for: ArtistData.self, inMemory: true)
+}
+
+/// Self-contained grid cell. SwiftUI assigns each instance of a `View` struct
+/// a stable identity, which fixes a class of LazyVGrid quirks where inline
+/// `ForEach` + `Button` + `.contextMenu` would route taps and long-press
+/// previews to the first iteration's data regardless of which tile was
+/// actually pressed.
+fileprivate struct ArtistGridCell<Tile: View, Menu: View, Preview: View>: View {
+    let onSelect: () -> Void
+    @ViewBuilder var tile: () -> Tile
+    @ViewBuilder var menu: () -> Menu
+    @ViewBuilder var preview: () -> Preview
+
+    var body: some View {
+        Button(action: onSelect) {
+            tile()
+        }
+        .buttonStyle(.plain)
+        .contextMenu(menuItems: menu, preview: preview)
+    }
 }

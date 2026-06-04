@@ -35,22 +35,28 @@ private enum ReleaseKindFilter: String, CaseIterable, Identifiable {
 
 struct HomeView: View {
     @Environment(\.modelContext) private var modelContext
-    @EnvironmentObject private var refreshCoordinator: RefreshCoordinator
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(RefreshCoordinator.self) private var refreshCoordinator
     @Query(filter: #Predicate<ArtistData> { artist in
         artist.isTracked
     }, sort: \ArtistData.name) private var trackedArtists: [ArtistData]
 
-    /// Set of every tracked artist's providerID. Used as an O(1) membership check
-    /// when filtering releases — previously this was a linear `.contains` per
-    /// release, which scaled badly with large libraries.
-    private var trackedArtistIDs: Set<String> {
-        Set(trackedArtists.map(\.providerID))
-    }
+    /// Memoized membership sets, updated by `refreshTrackedSets()` on tracked-roster
+    /// changes. Previously these were computed properties that rebuilt the Set
+    /// on every access — row methods (called per visible release) each triggered
+    /// a fresh O(N) walk over the tracked roster.
+    @State private var trackedArtistIDs: Set<String> = []
+    @State private var labelArtistIDs: Set<String> = []
 
-    /// Provider IDs of artists whose `kind == "label"`. Used to mark releases
-    /// pulled via record-label tracking with the LabelSourceBadge.
-    private var labelArtistIDs: Set<String> {
-        Set(trackedArtists.filter { $0.kind == "label" }.map(\.providerID))
+    private func refreshTrackedSets() {
+        var tracked: Set<String> = []
+        var labels: Set<String> = []
+        for artist in trackedArtists {
+            tracked.insert(artist.providerID)
+            if artist.kind == "label" { labels.insert(artist.providerID) }
+        }
+        if tracked != trackedArtistIDs { trackedArtistIDs = tracked }
+        if labels != labelArtistIDs { labelArtistIDs = labels }
     }
     @Query(sort: \ReleaseData.firstSeenAt, order: .reverse) private var storedReleases: [ReleaseData]
     @AppStorage(AppSettings.autoRefreshOnLaunch) private var autoRefreshOnLaunch = true
@@ -72,18 +78,31 @@ struct HomeView: View {
     @AppStorage("homeFeedLayout") private var feedLayoutRaw: String = "hybrid"
     @State private var hasAutoRefreshed = false
     @State private var showingSettings = false
+    @State private var showingRefreshDetail = false
     @State private var pullTriggered = false
     @State private var scrollAtTop = true
     @State private var releaseSearchText = ""
+    /// Debounced mirror of releaseSearchText. `derived` reads this instead of the
+    /// raw search text so the (potentially thousands of releases) filter loop
+    /// doesn't re-run on every keystroke.
+    @State private var debouncedSearchText = ""
+    @State private var searchDebounceTask: Task<Void, Never>?
     @State private var showingMarkAllConfirm = false
     @State private var isSearchPresented = false
+    /// Focus state for the custom inline search field. Bound via @FocusState so
+    /// we can pop the keyboard the instant the user taps the toolbar magnifier.
+    @FocusState private var searchFieldFocused: Bool
 
     private var feedFilter: ReleaseFeedFilter {
         ReleaseFeedFilter(rawValue: feedFilterRaw) ?? .releases
     }
 
     private var isRefreshing: Bool { refreshCoordinator.isRefreshing }
-    private var refreshProgress: ReleaseRefreshProgress? { refreshCoordinator.progress }
+    // Intentionally no `refreshProgress` getter here — reading the live progress
+    // value from HomeView would couple the body's invalidation to every progress
+    // tick (~6 Hz). The progress data is consumed by `RefreshProgressBar`
+    // instead, so HomeView only re-renders on the much rarer `isRefreshing`
+    // flips. See the bar view below.
     private var refreshMessage: String? { refreshCoordinator.message }
 
     /// Single-pass derivation of every list bucket the body needs. Previously
@@ -100,9 +119,50 @@ struct HomeView: View {
         var hasAnyTrackedRelease = false
     }
 
-    private var derived: DerivedReleases {
+    /// Cached `DerivedReleases` so the feed body can render instantly using
+    /// whatever bucketing was true at last compute. A `.task(id:)` driven by
+    /// `derivedKey` recomputes this *after* the first frame paints, so the
+    /// O(N) walk over all releases never blocks rendering. Without this the
+    /// `@Query` invalidation at refresh phase transitions caused multi-frame
+    /// hitches as the walk ran inline.
+    @State private var cachedDerived = DerivedReleases()
+
+    /// Composite identity key for `.task(id:)`. When any of these changes, the
+    /// derived recompute task fires. SwiftData @Query updates change
+    /// `storedReleases.count`; toggling `isSeen` or `dismissedAt` on an
+    /// individual release won't change the count but the view's own
+    /// onChange/state side effects refresh the cache where needed.
+    private struct DerivedKey: Hashable {
+        var releaseCount: Int
+        var trackedCount: Int
+        var search: String
+        var kindFilter: String
+        var showAlbums: Bool
+        var showSingles: Bool
+        var showEPs: Bool
+        var showLiveAlbums: Bool
+        var showCompilations: Bool
+        var showRemixes: Bool
+    }
+
+    private var derivedKey: DerivedKey {
+        DerivedKey(
+            releaseCount: storedReleases.count,
+            trackedCount: trackedArtistIDs.count,
+            search: debouncedSearchText,
+            kindFilter: releaseKindFilterRaw,
+            showAlbums: showAlbums,
+            showSingles: showSingles,
+            showEPs: showEPs,
+            showLiveAlbums: showLiveAlbums,
+            showCompilations: showCompilations,
+            showRemixes: showRemixes
+        )
+    }
+
+    private func computeDerived() -> DerivedReleases {
         let ids = trackedArtistIDs
-        let trimmedSearch = releaseSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSearch = debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let kindFilter = releaseKindFilter
         var out = DerivedReleases()
 
@@ -126,9 +186,11 @@ struct HomeView: View {
             out.visibleCount += 1
             if release.hasUnknownReleaseDate {
                 out.unknownDate.append(release)
-            } else if release.isNewRelease && !release.isSeen {
+            } else if !release.isSeen {
+                // Any unseen release — including past ones the user just
+                // toggled back to unseen — surfaces in the top bucket.
                 out.newReleases.append(release)
-            } else if release.isPastRelease || (release.isNewRelease && release.isSeen) {
+            } else {
                 out.pastAndSeen.append(release)
             }
         }
@@ -150,11 +212,18 @@ struct HomeView: View {
 
     var body: some View {
         // Compute once per render and reuse — see DerivedReleases.
-        let derived = derived
+        // Render from the cached projection. `.task(id: derivedKey)` keeps it
+        // fresh after frames paint, so the heavy walk doesn't block render.
+        let derived = cachedDerived
         return NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
                     header(derived: derived)
+
+                    if isSearchPresented {
+                        inlineSearchField
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
 
                     // Only surface the refresh message when it represents a failure that
                     // the user can retry. Success summaries ("Checked 83/83… Found N") are
@@ -237,7 +306,32 @@ struct HomeView: View {
             .navigationDestination(for: ReleaseData.self) { release in
                 AlbumView(release: release)
             }
-            .searchable(text: $releaseSearchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search releases")
+            // `.searchable` had a built-in pull-down-at-top reveal behavior we
+            // can't disable — see custom `inlineSearchField` below for the
+            // toolbar-button-controlled replacement.
+            .onChange(of: trackedArtists.count) { _, _ in refreshTrackedSets() }
+            .onAppear {
+                refreshTrackedSets()
+                // User likely just navigated back from AlbumView where they
+                // may have toggled a release's seen state. Recompute derived
+                // so the feed shows the up-to-date bucketing on return.
+                cachedDerived = computeDerived()
+            }
+            .onChange(of: releaseSearchText) { _, newValue in
+                // Empty → flip immediately so clearing the field shows the full feed
+                // without a stutter. Non-empty → 220ms debounce so each keystroke
+                // doesn't kick off a fresh derived-walk on every release row.
+                searchDebounceTask?.cancel()
+                if newValue.isEmpty {
+                    debouncedSearchText = ""
+                    return
+                }
+                searchDebounceTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 220_000_000)
+                    if Task.isCancelled { return }
+                    debouncedSearchText = newValue
+                }
+            }
             .onScrollGeometryChange(for: CGFloat.self) { geometry in
                 // contentOffset.y stays clamped at the top in SwiftUI's ScrollView during
                 // rubber-band, so we only use it to tell whether the user is *resting* at top.
@@ -245,10 +339,19 @@ struct HomeView: View {
             } action: { _, newOffset in
                 scrollAtTop = newOffset < 12
                 if newOffset > 40 { pullTriggered = false }
+                // Auto-hide the search bar once the user scrolls away from
+                // the top. Without this the bar stayed visible forever after
+                // the first pull-down reveal. Only collapses when the field
+                // is empty so we don't dismiss mid-query.
+                if newOffset > 80 && isSearchPresented && releaseSearchText.isEmpty {
+                    isSearchPresented = false
+                }
             }
             .simultaneousGesture(
-                // DragGesture fires reliably during overscroll. Threshold: user must start the
-                // drag while sitting at the top and pull down at least 120pt before we trigger.
+                // Pure pull-to-refresh. Search now lives behind a toolbar
+                // magnifying-glass tap (predictable + matches the Artists
+                // tab); overloading the same gesture for both was making
+                // the search bar appear unintentionally.
                 DragGesture(minimumDistance: 20)
                     .onChanged { value in
                         guard scrollAtTop,
@@ -260,12 +363,21 @@ struct HomeView: View {
                         startRefresh()
                     }
                     .onEnded { _ in
-                        // Allow the latch to clear once the gesture is over so the next pull retriggers.
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                             pullTriggered = false
                         }
                     }
             )
+            .task(id: derivedKey) {
+                // Defer the heavy `derived` walk until after the body's first
+                // frame has rendered. Without this the @Query invalidations
+                // triggered at refresh phase transitions (every time the
+                // background actor saves and storedReleases.count changes)
+                // would run the O(N) walk on the main thread inline before
+                // SwiftUI could paint, producing visible frame hitches.
+                await Task.yield()
+                cachedDerived = computeDerived()
+            }
             .task {
                 // Warm the artwork cache for everything visible — by the time the
                 // user scrolls or taps into a release, covers are already decoded
@@ -298,25 +410,42 @@ struct HomeView: View {
                     await TrackPrefetcher.prefetchBatch(providerIDs: topProviderIDs)
                 }
 
+            }
+            // One-shot auto-refresh keyed on a stable identity. The `id:` ensures the
+            // task body only fires once per HomeView lifetime even if SwiftUI tears down
+            // and recreates the `.task` (e.g. when an unrelated piece of state flips).
+            .task(id: "autoRefreshOnLaunch") {
                 guard autoRefreshOnLaunch, !hasAutoRefreshed, !trackedArtists.isEmpty else {
                     return
                 }
-
                 hasAutoRefreshed = true
                 startRefresh()
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 10) {
                         Button {
-                            startRefresh()
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                                isSearchPresented.toggle()
+                            }
+                            if !isSearchPresented {
+                                releaseSearchText = ""
+                                searchFieldFocused = false
+                            }
+                            // When opening, focus is set inside the field
+                            // itself via `.onAppear` — no timer-based delay.
                         } label: {
-                            Image(systemName: "arrow.clockwise")
+                            Image(systemName: "magnifyingglass")
                                 .font(.body.weight(.semibold))
-                                .foregroundStyle(refreshCoordinator.isRefreshing ? AppTheme.secondary : AppTheme.accent)
+                                .foregroundStyle(isSearchPresented ? AppTheme.accent : AppTheme.primaryText)
                         }
-                        .disabled(trackedArtists.isEmpty || refreshCoordinator.isRefreshing)
-                        .accessibilityLabel("Check for releases")
+                        .accessibilityLabel(isSearchPresented ? "Hide search" : "Search releases")
+
+                        ToolbarRefreshButton(
+                            isIdleDisabled: trackedArtists.isEmpty,
+                            onIdleTap: { startRefresh() },
+                            onActiveTap: { showingRefreshDetail = true }
+                        )
 
                         Menu {
                             Button {
@@ -351,9 +480,67 @@ struct HomeView: View {
                 NavigationStack {
                     SettingsView()
                 }
-                .environmentObject(refreshCoordinator)
+                .environment(refreshCoordinator)
+            }
+            .sheet(isPresented: $showingRefreshDetail) {
+                RefreshDetailSheet(isPresented: $showingRefreshDetail)
+                    .environment(refreshCoordinator)
+                    .presentationDetents([.height(220)])
+                    .presentationDragIndicator(.visible)
+                    .presentationBackground(AppTheme.background)
+            }
+            .onChange(of: refreshCoordinator.isRefreshing) { _, newValue in
+                // Auto-dismiss the detail sheet when the refresh ends so the
+                // user doesn't have to manually close a stale card.
+                if !newValue && showingRefreshDetail {
+                    showingRefreshDetail = false
+                }
             }
         }
+    }
+
+    /// Custom inline search field rendered just below the feed header. Replaces
+    /// SwiftUI's `.searchable` modifier because the latter installs a system
+    /// pull-to-reveal gesture at the top of the scroll view we can't opt out
+    /// of — the user wanted search to appear only via the toolbar magnifier.
+    private var inlineSearchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AppTheme.secondary)
+            TextField("Search releases", text: $releaseSearchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .foregroundStyle(AppTheme.primaryText)
+                .focused($searchFieldFocused)
+                .submitLabel(.search)
+                .onAppear {
+                    // Field is now in the hierarchy → safe to pop the
+                    // keyboard immediately. Far faster than the previous
+                    // 150ms timer-based focus.
+                    searchFieldFocused = true
+                }
+            if !releaseSearchText.isEmpty {
+                Button {
+                    releaseSearchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(AppTheme.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            Button("Cancel") {
+                releaseSearchText = ""
+                isSearchPresented = false
+                searchFieldFocused = false
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(AppTheme.accent)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 40)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(AppTheme.surface))
+        .padding(.horizontal, 18)
     }
 
     private func header(derived: DerivedReleases) -> some View {
@@ -373,11 +560,10 @@ struct HomeView: View {
                 typeFilterChip
             }
 
-            // Only show the progress bar inline; the icon refresh button is in the toolbar.
-            if refreshCoordinator.isRefreshing {
-                refreshProgressBar
-                    .transition(.opacity)
-            }
+            // Progress is now shown by the toolbar refresh icon (which fills
+            // as a circular arc) — much less screen real-estate. Tap the
+            // toolbar icon while refreshing to bring up the full detail card
+            // (current artist, X/Y count, stop button).
         }
         .padding(.horizontal, 18)
     }
@@ -385,9 +571,11 @@ struct HomeView: View {
     /// Three-state layout toggle: hybrid → list → grid → hybrid.
     private var layoutToggleChip: some View {
         Button {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                feedLayoutRaw = nextLayout(after: feedLayoutRaw)
-            }
+            // Don't wrap the layout flip in `withAnimation` — that would animate
+            // every visible release row's geometry change at once, which is a
+            // significant frame-budget hit on large feeds. The chip's own icon
+            // crossfade is handled by `.contentTransition(.symbolEffect)`.
+            feedLayoutRaw = nextLayout(after: feedLayoutRaw)
         } label: {
             Image(systemName: layoutIcon(for: feedLayoutRaw))
                 .font(.subheadline.weight(.semibold))
@@ -458,85 +646,6 @@ struct HomeView: View {
                 .font(.caption)
                 .foregroundStyle(AppTheme.secondary)
         }
-    }
-
-    private var refreshProgressBar: some View {
-        let fraction = refreshProgress?.fractionCompleted ?? 0
-        let checked = refreshProgress?.checkedArtists ?? 0
-        let total = refreshProgress?.totalArtists ?? trackedArtists.count
-        let current = refreshProgress?.currentArtistName ?? "Starting…"
-
-        // Layered approach: full-width track, then a fill anchored to the
-        // leading edge that scales horizontally to the current fraction.
-        // Avoids GeometryReader (which gave 0 width on the first layout pass
-        // and made the bar jump in on appear), and avoids tying the sheen
-        // animation to the changing fraction (which made it stutter when
-        // progress jumped).
-        ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(AppTheme.elevatedSurface)
-
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(AppTheme.accent)
-                .scaleEffect(x: max(0.0001, CGFloat(fraction)), y: 1, anchor: .leading)
-                .animation(.easeOut(duration: 0.35), value: fraction)
-                .overlay(
-                    // Continuous shimmer that lives in the filled region and
-                    // sweeps independently of the actual fraction value.
-                    TimelineView(.animation(minimumInterval: 1.0 / 30, paused: false)) { context in
-                        let t = context.date.timeIntervalSinceReferenceDate
-                            .truncatingRemainder(dividingBy: 1.8) / 1.8
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0),
-                                Color.white.opacity(0.22),
-                                Color.white.opacity(0)
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                        .opacity(0.9)
-                        .mask(
-                            Rectangle()
-                                .offset(x: -200 + 600 * CGFloat(t))
-                                .frame(width: 200)
-                        )
-                    }
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-            HStack(spacing: 10) {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.subheadline.weight(.semibold))
-                Text(current)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer()
-                Text("\(checked)/\(total)")
-                    .font(.footnote.weight(.semibold))
-                    .monospacedDigit()
-                Button {
-                    refreshCoordinator.cancel()
-                } label: {
-                    Image(systemName: "stop.fill")
-                        .font(.footnote.weight(.bold))
-                        .foregroundStyle(AppTheme.primaryText)
-                        .frame(width: 26, height: 26)
-                        .background(Circle().fill(AppTheme.primaryText.opacity(0.18)))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Stop checking")
-            }
-            .foregroundStyle(AppTheme.primaryText)
-            .padding(.horizontal, 14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(height: 46)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Checking \(checked) of \(total). Currently \(current).")
-        .accessibilityValue("\(Int(fraction * 100)) percent")
     }
 
 
@@ -714,7 +823,7 @@ struct HomeView: View {
             .aspectRatio(1, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(alignment: .topTrailing) {
-                if !release.isSeen && release.isNewRelease {
+                if !release.isSeen {
                     Circle()
                         .fill(AppTheme.accent)
                         .frame(width: 10, height: 10)
@@ -740,7 +849,7 @@ struct HomeView: View {
                 ReleaseTypeBadge(kind: release.kind)
             }
         }
-        .contextMenu { releaseContextMenu(release) }
+        .contextMenu { releaseContextMenu(release) } preview: { releaseContextMenuPreview(release) }
     }
 
     private func releaseRow(_ release: ReleaseData) -> some View {
@@ -775,7 +884,7 @@ struct HomeView: View {
 
             Spacer()
 
-            if !release.isSeen && release.isNewRelease {
+            if !release.isSeen {
                 Circle()
                     .fill(AppTheme.accent)
                     .frame(width: 7, height: 7)
@@ -786,7 +895,7 @@ struct HomeView: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(AppTheme.surface)
         )
-        .contextMenu { releaseContextMenu(release) }
+        .contextMenu { releaseContextMenu(release) } preview: { releaseContextMenuPreview(release) }
     }
 
     /// Hero list row: larger artwork, artist name in accent above the title.
@@ -825,7 +934,7 @@ struct HomeView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if !release.isSeen && release.isNewRelease {
+            if !release.isSeen {
                 Circle()
                     .fill(AppTheme.accent)
                     .frame(width: 9, height: 9)
@@ -836,7 +945,34 @@ struct HomeView: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(AppTheme.surface)
         )
-        .contextMenu { releaseContextMenu(release) }
+        .contextMenu { releaseContextMenu(release) } preview: { releaseContextMenuPreview(release) }
+    }
+
+    /// Lightweight long-press snapshot. Default `.contextMenu` lifts the entire
+    /// row including badges, ring overlays, and label-source chips, which can
+    /// stutter on weaker devices when the row is large. This preview is just the
+    /// artwork + two lines of text — fast to render and feels punchier.
+    private func releaseContextMenuPreview(_ release: ReleaseData) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            CachedAsyncImage(url: release.artworkURL) {
+                releaseArtworkPlaceholder(release)
+            }
+            .frame(width: 220, height: 220)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(ReleaseTitleFormatter.displayTitle(release.title))
+                    .font(.headline)
+                    .foregroundStyle(AppTheme.primaryText)
+                    .lineLimit(2)
+                Text(release.artistName)
+                    .font(.subheadline)
+                    .foregroundStyle(AppTheme.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(14)
+        .background(AppTheme.surface)
     }
 
     /// Long-press menu shared by every release surface in the feed. Covers the
@@ -845,11 +981,9 @@ struct HomeView: View {
     /// menu rather than duplicating button definitions.
     @ViewBuilder
     private func releaseContextMenu(_ release: ReleaseData) -> some View {
-        Button {
-            Task { _ = try? await CalendarService().addRelease(release) }
-        } label: {
-            Label("Add to Calendar", systemImage: "calendar.badge.plus")
-        }
+        // "Add to Calendar" lives on the album detail page (only relevant for
+        // upcoming releases). In the feed it just adds visual noise to every
+        // long-press menu, so it's hidden here.
         if let url = release.albumURL {
             Button {
                 UIApplication.shared.open(url)
@@ -864,6 +998,10 @@ struct HomeView: View {
         Button {
             release.isSeen.toggle()
             try? modelContext.save()
+            // Toggle doesn't change `storedReleases.count`, so .task(id:)
+            // won't refire. Refresh the cache inline so the row moves to
+            // the correct bucket immediately.
+            cachedDerived = computeDerived()
         } label: {
             Label(release.isSeen ? "Mark unseen" : "Mark seen",
                   systemImage: release.isSeen ? "circle" : "checkmark.circle")
@@ -871,6 +1009,7 @@ struct HomeView: View {
         Button(role: .destructive) {
             release.dismissedAt = Date()
             try? modelContext.save()
+            cachedDerived = computeDerived()
         } label: {
             Label("Dismiss", systemImage: "xmark")
         }
@@ -904,6 +1043,7 @@ struct HomeView: View {
             release.isSeen = true
         }
         try? modelContext.save()
+        cachedDerived = computeDerived()
     }
 
     private func startRefresh() {
@@ -946,5 +1086,229 @@ struct HomeView: View {
 #Preview {
     HomeView()
         .modelContainer(for: [ArtistData.self, ReleaseData.self], inMemory: true)
-        .environmentObject(RefreshCoordinator())
+        .environment(RefreshCoordinator())
 }
+
+/// Toolbar refresh control. When idle: a plain refresh icon that starts a new
+/// fetch on tap. When in-progress: a circular progress arc that fills with
+/// `checkedArtists / totalArtists` (or spins as an indeterminate quarter-arc
+/// during the warming / videos / concerts phases). Tapping during a refresh
+/// surfaces the detail sheet instead of trying to start a new one.
+///
+/// This view is its own observer of `RefreshCoordinator` so progress ticks
+/// (~6 Hz) don't bubble up to invalidate `HomeView.body`.
+fileprivate struct ToolbarRefreshButton: View {
+    @Environment(RefreshCoordinator.self) private var refreshCoordinator
+    let isIdleDisabled: Bool
+    let onIdleTap: () -> Void
+    let onActiveTap: () -> Void
+
+    private let arcSize: CGFloat = 22
+    private let lineWidth: CGFloat = 2.5
+
+    var body: some View {
+        Button {
+            if refreshCoordinator.isRefreshing {
+                onActiveTap()
+            } else {
+                onIdleTap()
+            }
+        } label: {
+            Group {
+                if refreshCoordinator.isRefreshing {
+                    arcContent
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(AppTheme.accent)
+                }
+            }
+            .frame(width: 30, height: 30)
+            .contentShape(Rectangle())
+        }
+        .disabled(!refreshCoordinator.isRefreshing && isIdleDisabled)
+        .accessibilityLabel(refreshCoordinator.isRefreshing
+                            ? "Refresh in progress, tap for details"
+                            : "Check for releases")
+    }
+
+    @ViewBuilder
+    private var arcContent: some View {
+        let progress = refreshCoordinator.progress
+        let isIndeterminate = progress?.isIndeterminate ?? true
+        let fraction = isIndeterminate ? 0.0 : (progress?.fractionCompleted ?? 0)
+
+        ZStack {
+            Circle()
+                .stroke(AppTheme.accent.opacity(0.22), lineWidth: lineWidth)
+            if isIndeterminate {
+                // Spinning quarter-arc — paused: false so SwiftUI keeps
+                // ticking the timeline regardless of state churn.
+                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: false)) { ctx in
+                    let degrees = ctx.date.timeIntervalSinceReferenceDate
+                        .truncatingRemainder(dividingBy: 1.0) * 360
+                    Circle()
+                        .trim(from: 0, to: 0.25)
+                        .stroke(AppTheme.accent, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                        .rotationEffect(.degrees(degrees))
+                }
+            } else {
+                Circle()
+                    .trim(from: 0, to: max(0.04, fraction))
+                    .stroke(AppTheme.accent, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeOut(duration: 0.3), value: fraction)
+            }
+        }
+        .frame(width: arcSize, height: arcSize)
+    }
+}
+
+/// Sheet shown when the user taps the toolbar arc during a refresh. Hosts the
+/// full progress bar plus the stop control. Auto-dismisses when the refresh
+/// finishes (see `.onChange(of: refreshCoordinator.isRefreshing)` in HomeView).
+fileprivate struct RefreshDetailSheet: View {
+    @Environment(RefreshCoordinator.self) private var refreshCoordinator
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Refreshing")
+                    .font(.title3.weight(.bold))
+                    .foregroundStyle(AppTheme.primaryText)
+                Spacer()
+                Button("Done") { isPresented = false }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(AppTheme.accent)
+            }
+
+            RefreshProgressBar()
+
+            Text(phaseDescription)
+                .font(.footnote)
+                .foregroundStyle(AppTheme.secondary)
+
+            Spacer()
+        }
+        .padding(20)
+    }
+
+    private var phaseDescription: String {
+        guard let progress = refreshCoordinator.progress else {
+            return "Starting…"
+        }
+        switch progress.phase {
+        case .warming: return "Connecting to Apple Music."
+        case .releases:
+            if progress.totalArtists > 0 {
+                return "Checking \(progress.checkedArtists) of \(progress.totalArtists) tracked artists for new releases."
+            }
+            return "Checking your tracked artists for new releases."
+        case .videos: return "Looking for new music videos."
+        case .concerts: return "Looking for new concert dates."
+        case .finishing: return "Wrapping up."
+        }
+    }
+}
+
+/// Refresh progress bar isolated as its own observer of `RefreshCoordinator`.
+/// HomeView used to render the bar inline, which made every progress tick
+/// (~6 Hz, plus phase changes) re-run the entire HomeView body — pulling the
+/// `derived` walk over the full release set onto the main thread on each tick.
+/// Putting the bar in its own view scopes those invalidations: only the bar's
+/// body re-renders on a progress change, leaving HomeView untouched.
+fileprivate struct RefreshProgressBar: View {
+    @Environment(RefreshCoordinator.self) private var refreshCoordinator
+
+    var body: some View {
+        let progress = refreshCoordinator.progress
+        let isIndeterminate = progress?.isIndeterminate ?? false
+        let phase = progress?.phase ?? .releases
+        let fraction: Double = isIndeterminate ? 1.0 : (progress?.fractionCompleted ?? 0)
+        let checked = progress?.checkedArtists ?? 0
+        let total = progress?.totalArtists ?? 0
+        let current: String = {
+            if isIndeterminate { return phase.rawValue + "…" }
+            return progress?.currentArtistName ?? "Starting…"
+        }()
+
+        // Layered approach: full-width track, then a fill anchored to the
+        // leading edge that scales horizontally to the current fraction.
+        // Avoids GeometryReader (which gave 0 width on the first layout pass
+        // and made the bar jump in on appear), and avoids tying the sheen
+        // animation to the changing fraction (which made it stutter when
+        // progress jumped).
+        return ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(AppTheme.elevatedSurface)
+
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(AppTheme.accent)
+                .scaleEffect(x: max(0.0001, CGFloat(fraction)), y: 1, anchor: .leading)
+                .animation(.easeOut(duration: 0.35), value: fraction)
+                .overlay(
+                    // Continuous shimmer that lives in the filled region and
+                    // sweeps independently of the actual fraction value.
+                    // 20fps is plenty for the gentle gradient sweep — at 30
+                    // it was contributing visible main-thread load during
+                    // refresh on older devices.
+                    TimelineView(.animation(minimumInterval: 1.0 / 20, paused: false)) { context in
+                        let t = context.date.timeIntervalSinceReferenceDate
+                            .truncatingRemainder(dividingBy: 1.8) / 1.8
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0),
+                                Color.white.opacity(0.22),
+                                Color.white.opacity(0)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                        .opacity(0.9)
+                        .mask(
+                            Rectangle()
+                                .offset(x: -200 + 600 * CGFloat(t))
+                                .frame(width: 200)
+                        )
+                    }
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.subheadline.weight(.semibold))
+                Text(current)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer()
+                if !isIndeterminate {
+                    Text("\(checked)/\(total)")
+                        .font(.footnote.weight(.semibold))
+                        .monospacedDigit()
+                }
+                Button {
+                    refreshCoordinator.cancel()
+                } label: {
+                    Image(systemName: "stop.fill")
+                        .font(.footnote.weight(.bold))
+                        .foregroundStyle(AppTheme.primaryText)
+                        .frame(width: 26, height: 26)
+                        .background(Circle().fill(AppTheme.primaryText.opacity(0.18)))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Stop checking")
+            }
+            .foregroundStyle(AppTheme.primaryText)
+            .padding(.horizontal, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(height: 46)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Checking \(checked) of \(total). Currently \(current).")
+        .accessibilityValue("\(Int(fraction * 100)) percent")
+    }
+}
+

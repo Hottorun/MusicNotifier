@@ -243,14 +243,8 @@ private struct CountdownPillStyle: ViewModifier {
 
 struct ReleaseHomeWidgetView: View {
     @Environment(\.widgetFamily) private var family
+    @Environment(\.widgetRenderingMode) private var renderingMode
     let entry: ReleaseWidgetProvider.Entry
-
-    private var todayReleases: [ReleaseWidgetItem] {
-        entry.releases.filter { release in
-            guard let releaseDate = release.releaseDate else { return false }
-            return Calendar.current.isDateInToday(releaseDate)
-        }
-    }
 
     private var upcomingReleases: [ReleaseWidgetItem] {
         entry.releases
@@ -263,155 +257,235 @@ struct ReleaseHomeWidgetView: View {
     var body: some View {
         Group {
             switch family {
-            case .systemMedium, .systemLarge:
-                todayLayout
+            case .systemSmall:
+                smallHero
+            case .systemMedium:
+                mediumSplit
+            case .systemLarge:
+                largeLayout
             default:
-                smallNextLayout
+                smallHero
             }
         }
-        .containerBackground(.fill.tertiary, for: .widget)
+        .widgetURL(nextRelease.map { URL(string: "musicnotifier://release/\($0.id)") } ?? URL(string: "musicnotifier://today"))
     }
 
-    private var smallNextLayout: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: "music.note")
-                    .font(.caption2.weight(.semibold))
-                Text("NEXT")
-                    .font(.caption2.weight(.bold))
-                    .tracking(0.8)
-                Spacer()
-                if WidgetHelpers.appIsRefreshing {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.caption2.weight(.bold))
-                }
-            }
-            .foregroundStyle(WidgetPalette.accent)
+    // MARK: Small — full-bleed artwork hero
+    //
+    // Important: the artwork lives in `.containerBackground(for: .widget) {...}`,
+    // NOT in the body's ZStack. Apple insets widget body content from the
+    // rounded widget edge — if the artwork were inside the body it would leave
+    // a `.fill.tertiary` (or whichever container fill we set) frame around the
+    // image, which is the "huge white rectangle" effect in dark/tinted mode.
+    // containerBackground is the only API that actually fills the rounded
+    // widget shape edge-to-edge.
 
-            if let release = nextRelease {
+    @ViewBuilder
+    private var smallHero: some View {
+        if let release = nextRelease {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 4) {
+                    Image(systemName: "music.note")
+                        .font(.system(size: 9, weight: .bold))
+                    Text("NEXT")
+                        .font(.caption2.weight(.bold))
+                        .tracking(0.9)
+                    Spacer(minLength: 0)
+                    if WidgetHelpers.appIsRefreshing {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                }
+                .foregroundStyle(heroForeground.opacity(0.9))
+
+                Spacer(minLength: 0)
+
                 Text(release.title)
                     .font(.system(size: 15, weight: .bold, design: .rounded))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(heroForeground)
                     .lineLimit(2)
                 Text(release.artistName)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(heroForeground.opacity(0.85))
                     .lineLimit(1)
-                Spacer(minLength: 0)
                 CountdownPill(text: WidgetHelpers.countdownText(for: release.releaseDate))
-            } else {
-                Text("No upcoming releases")
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
+                    .padding(.top, 2)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .containerBackground(for: .widget) {
+                smallHeroBackground(for: release)
+            }
+        } else {
+            emptyState
+                .containerBackground(.fill.tertiary, for: .widget)
+        }
+    }
+
+    /// Background painted by `.containerBackground`. In full-color we layer the
+    /// album artwork under a vertical dark gradient that gives the white text
+    /// a reliable contrast floor. In tinted/vibrant modes a per-pixel image
+    /// gets flattened to luminance and looks muddy — we substitute an accent
+    /// gradient instead, which the system tints cleanly.
+    @ViewBuilder
+    private func smallHeroBackground(for release: ReleaseWidgetItem) -> some View {
+        if renderingMode == .fullColor, let image = WidgetHelpers.cachedArtwork(for: release) {
+            ZStack {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                LinearGradient(
+                    colors: [Color.black.opacity(0), Color.black.opacity(0.35), Color.black.opacity(0.78)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+        } else {
+            LinearGradient(
+                colors: [WidgetPalette.accent.opacity(0.75), WidgetPalette.accent.opacity(0.30)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+    }
+
+    /// White text reads well over a full-color artwork+gradient, but in
+    /// tinted/vibrant mode the system maps `.white` to flat full-tint which
+    /// disappears into the equally-tinted background. `.primary` lets the
+    /// system pick the correct luminance for the active rendering mode.
+    private var heroForeground: Color {
+        renderingMode == .fullColor ? .white : .primary
+    }
+
+    // MARK: Medium — left hero, right upcoming list
+
+    @ViewBuilder
+    private var mediumSplit: some View {
+        if let hero = nextRelease {
+            HStack(alignment: .top, spacing: 12) {
+                ZStack(alignment: .bottomLeading) {
+                    artworkView(for: hero, size: 140, corner: 12)
+                    LinearGradient(
+                        colors: [Color.black.opacity(0), Color.black.opacity(0.55)],
+                        startPoint: .center,
+                        endPoint: .bottom
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .allowsHitTesting(false)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(hero.title)
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        CountdownPill(text: WidgetHelpers.compactCountdown(for: hero.releaseDate))
+                    }
+                    .padding(8)
+                }
+                .frame(width: 140, height: 140)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 4) {
+                        Text("UPCOMING")
+                            .font(.caption2.weight(.bold))
+                            .tracking(0.7)
+                            .foregroundStyle(WidgetPalette.accent)
+                        Spacer()
+                        if WidgetHelpers.appIsRefreshing {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(WidgetPalette.accent)
+                        }
+                    }
+                    // Skip the hero in the side list so the user isn't seeing
+                    // the same release twice. Cap at 3 for the medium family.
+                    ForEach(Array(upcomingReleases.dropFirst().prefix(3))) { release in
+                        compactRow(release)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            .padding(12)
+            .containerBackground(.fill.tertiary, for: .widget)
+        } else {
+            emptyState
+                .containerBackground(.fill.tertiary, for: .widget)
+        }
+    }
+
+    // MARK: Large — hero header + full list
+
+    @ViewBuilder
+    private var largeLayout: some View {
+        if let hero = nextRelease {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    artworkView(for: hero, size: 92, corner: 12)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("NEXT RELEASE")
+                            .font(.caption2.weight(.bold))
+                            .tracking(0.8)
+                            .foregroundStyle(WidgetPalette.accent)
+                        Text(hero.title)
+                            .font(.system(size: 17, weight: .bold, design: .rounded))
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                        Text(hero.artistName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        CountdownPill(text: WidgetHelpers.countdownText(for: hero.releaseDate))
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                Divider()
+
+                VStack(spacing: 6) {
+                    ForEach(Array(upcomingReleases.dropFirst().prefix(5))) { release in
+                        Link(destination: deepLink(for: release)) {
+                            compactRow(release)
+                        }
+                    }
+                }
                 Spacer(minLength: 0)
-                Text("Open the app to check again")
+            }
+            .padding(14)
+            .containerBackground(.fill.tertiary, for: .widget)
+        } else {
+            emptyState
+                .containerBackground(.fill.tertiary, for: .widget)
+        }
+    }
+
+    // MARK: Building blocks
+
+    private func compactRow(_ release: ReleaseWidgetItem) -> some View {
+        HStack(spacing: 8) {
+            artworkView(for: release, size: 30, corner: 6)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(release.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(release.artistName)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
+            Spacer(minLength: 4)
+            CompactCountdownPill(text: WidgetHelpers.compactCountdown(for: release.releaseDate))
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-        .widgetURL(nextRelease.map { URL(string: "musicnotifier://release/\($0.id)") } ?? nil)
-    }
-
-    private var todayLayout: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "calendar")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(WidgetPalette.accent)
-                Text("TODAY")
-                    .font(.caption.weight(.bold))
-                    .tracking(0.8)
-                    .foregroundStyle(WidgetPalette.accent)
-                Spacer()
-                if WidgetHelpers.appIsRefreshing {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(WidgetPalette.accent)
-                }
-                if !todayReleases.isEmpty {
-                    Text("\(todayReleases.count)")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.primary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Capsule().fill(WidgetPalette.accentSoft))
-                }
-            }
-
-            if todayReleases.isEmpty {
-                if upcomingReleases.isEmpty {
-                    Text("Nothing tracked is dropping today")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                } else {
-                    // Show the upcoming queue with per-row deep links into each
-                    // release, plus the days-until countdown. Container link
-                    // intentionally omitted here — each row is its own target.
-                    let cap = family == .systemLarge ? 6 : 3
-                    ForEach(upcomingReleases.prefix(cap)) { release in
-                        Link(destination: deepLink(for: release)) {
-                            HStack(spacing: 10) {
-                                artworkView(for: release, size: 32)
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(release.title)
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
-                                    Text(release.artistName)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                                Spacer(minLength: 4)
-                                CompactCountdownPill(text: WidgetHelpers.compactCountdown(for: release.releaseDate))
-                            }
-                        }
-                    }
-                    Spacer(minLength: 0)
-                }
-            } else {
-                ForEach(todayReleases.prefix(family == .systemLarge ? 6 : 3)) { release in
-                    Link(destination: deepLink(for: release)) {
-                        HStack(spacing: 10) {
-                            artworkView(for: release, size: 32)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(release.title)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.primary)
-                                    .lineLimit(1)
-                                Text(release.artistName)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                        }
-                    }
-                }
-                Spacer(minLength: 0)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-        // Tap on empty/header areas opens the Today view; row taps deep-link.
-        .widgetURL(URL(string: "musicnotifier://today"))
-    }
-
-    private func deepLink(for release: ReleaseWidgetItem) -> URL {
-        URL(string: "musicnotifier://release/\(release.id)") ?? URL(string: "musicnotifier://today")!
     }
 
     @ViewBuilder
-    private func artworkView(for release: ReleaseWidgetItem, size: CGFloat) -> some View {
-        if let image = WidgetHelpers.cachedArtwork(for: release) {
+    private func artworkView(for release: ReleaseWidgetItem, size: CGFloat, corner: CGFloat = 6) -> some View {
+        if renderingMode == .fullColor, let image = WidgetHelpers.cachedArtwork(for: release) {
             Image(uiImage: image)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .clipShape(RoundedRectangle(cornerRadius: corner))
         } else {
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: corner)
                 .fill(WidgetPalette.accentSoft)
                 .frame(width: size, height: size)
                 .overlay {
@@ -420,6 +494,26 @@ struct ReleaseHomeWidgetView: View {
                         .foregroundStyle(WidgetPalette.accent)
                 }
         }
+    }
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Image(systemName: "music.note")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(WidgetPalette.accent)
+            Text("No upcoming releases")
+                .font(.headline)
+                .foregroundStyle(.primary)
+            Text("Open the app to check again")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .padding(14)
+    }
+
+    private func deepLink(for release: ReleaseWidgetItem) -> URL {
+        URL(string: "musicnotifier://release/\(release.id)") ?? URL(string: "musicnotifier://today")!
     }
 }
 
@@ -460,22 +554,25 @@ struct UpcomingListWidgetView: View {
             } else {
                 let cap = family == .systemLarge ? 6 : 3
                 ForEach(upcoming.prefix(cap)) { release in
-                    HStack(spacing: 10) {
-                        Text(WidgetHelpers.compactCountdown(for: release.releaseDate))
-                            .font(.caption2.weight(.bold))
-                            .monospacedDigit()
-                            .foregroundStyle(WidgetPalette.accent)
-                            .frame(width: 36, alignment: .leading)
+                    Link(destination: URL(string: "musicnotifier://release/\(release.id)") ?? URL(string: "musicnotifier://upcoming")!) {
+                        HStack(spacing: 10) {
+                            UpcomingArtworkThumb(release: release)
 
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(release.title)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                            Text(release.artistName)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(release.title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Text(release.artistName)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer(minLength: 4)
+                            Text(WidgetHelpers.compactCountdown(for: release.releaseDate))
+                                .font(.caption2.weight(.bold))
+                                .monospacedDigit()
+                                .foregroundStyle(WidgetPalette.accent)
                         }
                     }
                 }
@@ -485,6 +582,290 @@ struct UpcomingListWidgetView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .containerBackground(.fill.tertiary, for: .widget)
         .widgetURL(URL(string: "musicnotifier://upcoming"))
+    }
+}
+
+/// Small artwork thumb used by the upcoming list rows. Respects the widget
+/// rendering mode the same way `ReleaseHomeWidgetView.artworkView` does — tinted
+/// and vibrant lock-screen modes fall back to a symbol placeholder instead of a
+/// muddy color-mapped image.
+private struct UpcomingArtworkThumb: View {
+    let release: ReleaseWidgetItem
+    @Environment(\.widgetRenderingMode) private var renderingMode
+
+    var body: some View {
+        if renderingMode == .fullColor, let image = WidgetHelpers.cachedArtwork(for: release) {
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 30, height: 30)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+        } else {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(WidgetPalette.accentSoft)
+                .frame(width: 30, height: 30)
+                .overlay {
+                    Image(systemName: "music.note")
+                        .font(.caption)
+                        .foregroundStyle(WidgetPalette.accent)
+                }
+        }
+    }
+}
+
+// MARK: - Calendar widget — month grid with release-day dots
+
+struct CalendarWidgetView: View {
+    @Environment(\.widgetFamily) private var family
+    @Environment(\.widgetRenderingMode) private var renderingMode
+    let entry: ReleaseWidgetProvider.Entry
+
+    /// Dates (start-of-day) within the visible month that have at least one
+    /// tracked release. We keep both the set (for fast "is this day a release
+    /// day?" checks during grid render) and a per-day map for the side list.
+    private var releaseDaysByDay: [Date: [ReleaseWidgetItem]] {
+        let calendar = Calendar.current
+        var out: [Date: [ReleaseWidgetItem]] = [:]
+        for release in entry.releases {
+            guard let date = release.releaseDate else { continue }
+            let day = calendar.startOfDay(for: date)
+            out[day, default: []].append(release)
+        }
+        return out
+    }
+
+    private var nextThree: [ReleaseWidgetItem] {
+        let today = Calendar.current.startOfDay(for: Date())
+        return entry.releases
+            .filter { ($0.releaseDate ?? .distantFuture) >= today }
+            .sorted { ($0.releaseDate ?? .distantFuture) < ($1.releaseDate ?? .distantFuture) }
+            .prefix(family == .systemLarge ? 5 : 3)
+            .map { $0 }
+    }
+
+    var body: some View {
+        Group {
+            switch family {
+            case .systemLarge:
+                largeBody
+            default:
+                mediumBody
+            }
+        }
+        .containerBackground(.fill.tertiary, for: .widget)
+        .widgetURL(URL(string: "musicnotifier://upcoming"))
+    }
+
+    private var mediumBody: some View {
+        HStack(alignment: .top, spacing: 12) {
+            calendarGrid(cellSize: 16, spacing: 4)
+                .frame(maxWidth: .infinity)
+            sideList
+                .frame(maxWidth: .infinity)
+        }
+        .padding(12)
+    }
+
+    private var largeBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(monthLabel.uppercased())
+                    .font(.caption.weight(.bold))
+                    .tracking(0.9)
+                    .foregroundStyle(WidgetPalette.accent)
+                Spacer()
+                Text("\(releaseDaysByDay.values.reduce(0) { $0 + $1.count }) releases")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            calendarGrid(cellSize: 30, spacing: 6)
+            Divider()
+            VStack(spacing: 6) {
+                ForEach(nextThree) { release in
+                    Link(destination: URL(string: "musicnotifier://release/\(release.id)") ?? URL(string: "musicnotifier://upcoming")!) {
+                        listRow(release)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+    }
+
+    // MARK: Grid
+
+    private func calendarGrid(cellSize: CGFloat, spacing: CGFloat) -> some View {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let monthInterval = calendar.dateInterval(of: .month, for: today) ?? DateInterval(start: today, duration: 0)
+        let firstWeekday = calendar.component(.weekday, from: monthInterval.start)
+        // Convert weekday (1=Sun) into a leading-blank count so day 1 aligns
+        // under the right column header. Treats Sunday as the first column.
+        let leadingBlanks = firstWeekday - calendar.firstWeekday
+        let daysInMonth = calendar.range(of: .day, in: .month, for: today)?.count ?? 30
+        let totalCells = leadingBlanks + daysInMonth
+        let weeks = Int(ceil(Double(totalCells) / 7.0))
+
+        let releaseDays = releaseDaysByDay
+
+        return VStack(alignment: .leading, spacing: spacing) {
+            HStack(spacing: spacing) {
+                ForEach(weekdaySymbols, id: \.self) { symbol in
+                    Text(symbol)
+                        .font(.system(size: max(8, cellSize * 0.42), weight: .bold))
+                        .tracking(0.4)
+                        .foregroundStyle(.secondary)
+                        .frame(width: cellSize, height: cellSize * 0.7)
+                }
+            }
+
+            ForEach(0..<weeks, id: \.self) { week in
+                HStack(spacing: spacing) {
+                    ForEach(0..<7, id: \.self) { weekday in
+                        let cellIndex = week * 7 + weekday
+                        let dayNumber = cellIndex - leadingBlanks + 1
+                        if dayNumber >= 1 && dayNumber <= daysInMonth,
+                           let dayDate = calendar.date(byAdding: .day, value: dayNumber - 1, to: monthInterval.start) {
+                            calendarCell(
+                                dayNumber: dayNumber,
+                                isToday: calendar.isDate(dayDate, inSameDayAs: today),
+                                releaseCount: releaseDays[calendar.startOfDay(for: dayDate)]?.count ?? 0,
+                                cellSize: cellSize
+                            )
+                        } else {
+                            Color.clear.frame(width: cellSize, height: cellSize)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func calendarCell(dayNumber: Int, isToday: Bool, releaseCount: Int, cellSize: CGFloat) -> some View {
+        // Tinted/vibrant render modes flatten any colored fill to the system's
+        // tint luminance (~white on dark tints), which made the previous
+        // `Circle().fill(accent)` cover the day number with a solid white blob.
+        // Use a stroked ring in those modes and switch the number's color to
+        // `.primary` so the system can pick the right contrast for us.
+        let isFullColor = renderingMode == .fullColor
+
+        ZStack {
+            if isToday {
+                if isFullColor {
+                    Circle()
+                        .fill(WidgetPalette.accent)
+                        .frame(width: cellSize, height: cellSize)
+                } else {
+                    Circle()
+                        .strokeBorder(.primary, lineWidth: max(1, cellSize * 0.05))
+                        .frame(width: cellSize, height: cellSize)
+                }
+            } else if releaseCount > 0 && isFullColor {
+                Circle()
+                    .fill(WidgetPalette.accentSoft)
+                    .frame(width: cellSize, height: cellSize)
+            }
+            Text("\(dayNumber)")
+                .font(.system(size: max(8, cellSize * 0.45), weight: isToday ? .bold : .medium))
+                .foregroundStyle(dayNumberColor(isToday: isToday, releaseCount: releaseCount, isFullColor: isFullColor))
+                .monospacedDigit()
+            if releaseCount > 0 && !isToday {
+                // Small marker below the number. Filled dot in full color,
+                // primary dot in tinted modes — either way distinct from a
+                // plain weekday.
+                Group {
+                    if isFullColor {
+                        Circle().fill(WidgetPalette.accent)
+                    } else {
+                        Circle().fill(.primary)
+                    }
+                }
+                .frame(width: max(3, cellSize * 0.13), height: max(3, cellSize * 0.13))
+                .offset(y: cellSize * 0.32)
+            }
+        }
+        .frame(width: cellSize, height: cellSize)
+    }
+
+    private func dayNumberColor(isToday: Bool, releaseCount: Int, isFullColor: Bool) -> Color {
+        if isToday {
+            return isFullColor ? .white : .primary
+        }
+        if releaseCount > 0 {
+            return isFullColor ? WidgetPalette.accent : .primary
+        }
+        return .primary
+    }
+
+    // MARK: Side list (medium)
+
+    private var sideList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(monthLabel.uppercased())
+                .font(.caption2.weight(.bold))
+                .tracking(0.7)
+                .foregroundStyle(WidgetPalette.accent)
+            if nextThree.isEmpty {
+                Text("No upcoming")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(nextThree) { release in
+                    Link(destination: URL(string: "musicnotifier://release/\(release.id)") ?? URL(string: "musicnotifier://upcoming")!) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(release.title)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            HStack(spacing: 4) {
+                                Text(release.artistName)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Spacer(minLength: 2)
+                                Text(WidgetHelpers.compactCountdown(for: release.releaseDate))
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(WidgetPalette.accent)
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func listRow(_ release: ReleaseWidgetItem) -> some View {
+        HStack(spacing: 8) {
+            UpcomingArtworkThumb(release: release)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(release.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(release.artistName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            CompactCountdownPill(text: WidgetHelpers.compactCountdown(for: release.releaseDate))
+        }
+    }
+
+    private var weekdaySymbols: [String] {
+        let calendar = Calendar.current
+        let symbols = calendar.veryShortStandaloneWeekdaySymbols
+        // Rotate so position 0 matches calendar.firstWeekday (1=Sun in en_US).
+        let first = calendar.firstWeekday - 1
+        return Array(symbols[first...] + symbols[..<first])
+    }
+
+    private var monthLabel: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM yyyy"
+        return formatter.string(from: Date())
     }
 }
 
@@ -612,6 +993,19 @@ struct MusicNotifierUpcomingWidget: Widget {
     }
 }
 
+struct MusicNotifierCalendarWidget: Widget {
+    let kind: String = "MusicNotifierCalendarWidget"
+
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: kind, provider: ReleaseWidgetProvider()) { entry in
+            CalendarWidgetView(entry: entry)
+        }
+        .configurationDisplayName("Release Calendar")
+        .description("This month at a glance — release days highlighted.")
+        .supportedFamilies([.systemMedium, .systemLarge])
+    }
+}
+
 struct MusicNotifierLockScreenWidget: Widget {
     let kind: String = "MusicNotifierLockScreenWidget"
 
@@ -630,6 +1024,7 @@ struct MusicNotifierWidgets: WidgetBundle {
     var body: some Widget {
         MusicNotifierHomeWidget()
         MusicNotifierUpcomingWidget()
+        MusicNotifierCalendarWidget()
         MusicNotifierLockScreenWidget()
     }
 }

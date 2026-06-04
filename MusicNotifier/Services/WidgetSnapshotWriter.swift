@@ -30,12 +30,16 @@ struct WidgetArtworkRequest: Sendable {
 enum WidgetSnapshotWriter {
     static let fileName = "widget-releases.json"
 
-    @discardableResult
-    static func write(releases: [ReleaseData]?) -> [WidgetArtworkRequest] {
-        guard let releases else { return [] }
-        // Widget views care about "upcoming" + "today" + "very recent past".
-        // Sort by absolute distance from today so soonest-future and most-recent-past
-        // appear first; old historical releases fall off the end of the 40-item budget.
+    /// Build the Sendable snapshot + artwork request list from a list of
+    /// `ReleaseData` instances. Safe to call from any actor as long as the
+    /// supplied releases all belong to the caller's `ModelContext` (so the
+    /// property reads are on the right executor). Caller hands the returned
+    /// snapshot to `persist(_:)` from a detached task — JSON encoding + disk
+    /// write are the expensive parts.
+    static func captureSnapshot(from releases: [ReleaseData]?) -> (snapshot: WidgetSnapshot, requests: [WidgetArtworkRequest]) {
+        guard let releases else {
+            return (WidgetSnapshot(generatedAt: Date(), releases: []), [])
+        }
         let now = Date()
         let withDates = releases.filter { $0.dismissedAt == nil && $0.releaseDate != nil }
         let withoutDates = releases.filter { $0.dismissedAt == nil && $0.releaseDate == nil }
@@ -44,8 +48,6 @@ enum WidgetSnapshotWriter {
             let r = abs(rhs.releaseDate!.timeIntervalSince(now))
             return l < r
         }
-        // Within the 40-item budget: prioritize dated releases, then any
-        // unknown-date entries at the end as filler.
         let limitedReleases = Array((sortedByProximity + withoutDates).prefix(40))
 
         let snapshots = limitedReleases.map { release in
@@ -60,14 +62,16 @@ enum WidgetSnapshotWriter {
                 type: release.type
             )
         }
+        let snapshot = WidgetSnapshot(generatedAt: now, releases: snapshots)
+        let requests = snapshots.map { WidgetArtworkRequest(id: $0.id, artworkURL: $0.artworkURL) }
+        return (snapshot, requests)
+    }
 
-        let snapshot = WidgetSnapshot(
-            generatedAt: Date(),
-            releases: snapshots
-        )
-
-        guard let url = snapshotURL() else { return [] }
-
+    /// Off-main JSON encode + atomic disk write + widget timeline reload.
+    /// Safe to call from a detached task — touches neither SwiftUI nor
+    /// SwiftData state.
+    static func persist(snapshot: WidgetSnapshot) {
+        guard let url = snapshotURL() else { return }
         do {
             let data = try JSONEncoder.widgetSnapshotEncoder.encode(snapshot)
             try data.write(to: url, options: [.atomic])
@@ -75,8 +79,17 @@ enum WidgetSnapshotWriter {
         } catch {
             print("Failed to write widget snapshot: \(error)")
         }
+    }
 
-        return snapshots.map { WidgetArtworkRequest(id: $0.id, artworkURL: $0.artworkURL) }
+    /// Legacy entrypoint kept for any callers outside of the refresh pipeline.
+    /// New callers in performance-sensitive paths should split via
+    /// `captureSnapshot` + a detached `persist`.
+    @MainActor
+    @discardableResult
+    static func write(releases: [ReleaseData]?) -> [WidgetArtworkRequest] {
+        let (snapshot, requests) = captureSnapshot(from: releases)
+        persist(snapshot: snapshot)
+        return requests
     }
 
     static func cacheArtwork(for requests: [WidgetArtworkRequest]) async {

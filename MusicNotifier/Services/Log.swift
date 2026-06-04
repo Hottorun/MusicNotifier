@@ -12,7 +12,7 @@ import Foundation
 enum Log {
     /// Flip to `true` to re-enable [AppGroup], [Refresh], [Favorites],
     /// [Spotify], [Dedup], and AppleMusicVideoService verbose prints.
-    static let verbose = true
+    static let verbose = false
     @inline(__always)
     static func v(_ message: @autoclosure () -> String) {
         if verbose { print(message()) }

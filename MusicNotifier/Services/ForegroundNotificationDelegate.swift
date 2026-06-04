@@ -11,6 +11,17 @@ extension Notification.Name {
     /// is the destination URL (`musicnotifier://release/<id>` or
     /// `musicnotifier://today`). ContentView subscribes and routes via DeepLinkRouter.
     static let musicNotifierDeepLinkTapped = Notification.Name("musicNotifierDeepLinkTapped")
+
+    /// Posted by Mac/iPad menu commands. Object is the destination tab index
+    /// (Int). ContentView's sidebar layout listens and updates its selection.
+    static let musicNotifierSelectTab = Notification.Name("musicNotifierSelectTab")
+
+    /// Posted by the ⌘R menu command. Whoever currently owns refresh state
+    /// (Home view / sidebar footer) starts a refresh.
+    static let musicNotifierRequestRefresh = Notification.Name("musicNotifierRequestRefresh")
+
+    /// Posted by the ⌘, menu command. ContentView opens the settings sheet.
+    static let musicNotifierOpenSettings = Notification.Name("musicNotifierOpenSettings")
 }
 
 /// Without this delegate, iOS suppresses notifications while the app is in the foreground.

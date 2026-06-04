@@ -9,13 +9,22 @@ import Combine
 import WidgetKit
 import MusicKit
 
-/// Owns the refresh task and exposes live progress. ObservableObject + @Published
-/// is more reliable across SwiftUI's TabView appearance lifecycle than @Observable.
+/// Owns the refresh task and exposes live progress.
+///
+/// Switched from `ObservableObject + @Published` to `@Observable` because the
+/// progress field updates ~6 Hz during a refresh, and `@Published` broadcasts
+/// `objectWillChange` to every observing view on every change — even ones
+/// that only read `isRefreshing`. That made `HomeView.body` re-run on every
+/// tick, dragging the `derived` walk over thousands of `ReleaseData` rows
+/// through the main thread and producing the visible refresh-time lag.
+/// `@Observable` does per-property change tracking, so a view that only
+/// touches `isRefreshing` is unaffected by `progress` flips.
 @MainActor
-final class RefreshCoordinator: ObservableObject {
-    @Published var isRefreshing: Bool = false
-    @Published var progress: ReleaseRefreshProgress?
-    @Published var message: String?
+@Observable
+final class RefreshCoordinator {
+    var isRefreshing: Bool = false
+    var progress: ReleaseRefreshProgress?
+    var message: String?
 
     private var task: Task<Void, Never>?
     private var watchdog: Task<Void, Never>?
@@ -38,16 +47,6 @@ final class RefreshCoordinator: ObservableObject {
         notificationHour: Int,
         notificationMinute: Int
     ) {
-        // DIAGNOSTIC: if this prints nil, the App Group capability isn't
-        // authorized on the App ID and widget writes are landing in the main
-        // app's documents directory (where the widget can't see them).
-        let groupID = AppSettings.appGroupIdentifier
-        let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID)
-        let defaults = UserDefaults(suiteName: groupID)
-        Log.v("[AppGroup] id=\(groupID)")
-        Log.v("[AppGroup] container=\(container?.path ?? "nil")")
-        Log.v("[AppGroup] suiteUserDefaults=\(defaults == nil ? "nil" : "ok")")
-
         task?.cancel()
         task = nil
         watchdog?.cancel()
@@ -66,7 +65,9 @@ final class RefreshCoordinator: ObservableObject {
         progress = ReleaseRefreshProgress(
             checkedArtists: 0,
             totalArtists: trackedArtists.count,
-            currentArtistName: "Starting"
+            currentArtistName: "Starting",
+            phase: .warming,
+            isIndeterminate: true
         )
 
         // Capture pure-Sendable inputs so the off-main work never touches SwiftData models.
@@ -167,7 +168,9 @@ final class RefreshCoordinator: ObservableObject {
                             self?.progress = ReleaseRefreshProgress(
                                 checkedArtists: checkedSnapshot,
                                 totalArtists: totalCount,
-                                currentArtistName: currentName
+                                currentArtistName: currentName,
+                                phase: .releases,
+                                isIndeterminate: false
                             )
                         }
                     }
@@ -214,16 +217,42 @@ final class RefreshCoordinator: ObservableObject {
             // Videos pass — only runs when the user has opted in via Settings.
             // Uses the catalog artist IDs that release refresh just resolved.
             let videosEnabled = UserDefaults.standard.object(forKey: AppSettings.enableVideosTab) as? Bool ?? false
+            let concertsEnabled = UserDefaults.standard.object(forKey: AppSettings.enableConcertsTab) as? Bool ?? false
+
+            // Phase-aware sequential tail. Releases are done; videos+concerts now show
+            // their own phase label on the progress bar instead of leaving it frozen at
+            // 100% — that's the symptom of "considerable time stuck loading" the user hit.
+            //
+            // We *don't* parallelize videos+concerts at this layer: ArtistData and
+            // ModelContext aren't Sendable, and wrapping the @MainActor service calls in
+            // async-let closures captures them across an isolated boundary (Swift 6 warning).
+            // The bigger parallelism wins live inside each service (intra-videos parallel
+            // already done in AppleMusicVideoService).
             if videosEnabled && !Task.isCancelled {
+                await MainActor.run { [weak self] in
+                    self?.progress = ReleaseRefreshProgress(
+                        checkedArtists: totalCount,
+                        totalArtists: totalCount,
+                        currentArtistName: RefreshPhase.videos.rawValue,
+                        phase: .videos,
+                        isIndeterminate: true
+                    )
+                }
                 _ = await VideoRefreshService().refresh(
                     trackedArtists: trackedArtists,
                     modelContext: modelContext
                 )
             }
-
-            // Concerts pass — Bandsintown lookup per tracked artist when opted in.
-            let concertsEnabled = UserDefaults.standard.object(forKey: AppSettings.enableConcertsTab) as? Bool ?? false
             if concertsEnabled && !Task.isCancelled {
+                await MainActor.run { [weak self] in
+                    self?.progress = ReleaseRefreshProgress(
+                        checkedArtists: totalCount,
+                        totalArtists: totalCount,
+                        currentArtistName: RefreshPhase.concerts.rawValue,
+                        phase: .concerts,
+                        isIndeterminate: true
+                    )
+                }
                 _ = await ConcertRefreshService().refresh(
                     trackedArtists: trackedArtists,
                     modelContext: modelContext
