@@ -29,11 +29,13 @@ final class RefreshCoordinator {
     private var task: Task<Void, Never>?
     private var watchdog: Task<Void, Never>?
 
-    /// Apple Music returns HTTP 429 ("API capacity exceeded") well before 16-way
-    /// fan-out, especially when `.with([.albums])` triggers nested subrequests.
-    /// Keep this low to stay below the rate limit; the retry/backoff in
-    /// AppleMusicReleaseService.withRetry absorbs the occasional spike.
-    private let maxConcurrent = 4
+    /// Concurrency cap is now adaptive (AIMD). Start higher than the old
+    /// fixed `4` since the primary path is now REST `sort=-releaseDate`
+    /// (no nested MusicKit subrequests). Halve on detected 429, bump by 1
+    /// after 10 consecutive rate-limit-free outcomes.
+    private let initialConcurrent = 6
+    private let minConcurrent = 2
+    private let maxConcurrentCap = 10
 
     /// Hard cap on foreground refresh duration. Anything beyond this almost certainly
     /// means a network stall — surface it instead of letting the user stare at a frozen bar.
@@ -75,7 +77,9 @@ final class RefreshCoordinator {
             ArtistFetchInput(providerID: $0.providerID, name: $0.name, provider: $0.provider, catalogArtistID: $0.catalogArtistID, kind: $0.kind)
         }
         let totalCount = inputs.count
-        let concurrent = min(maxConcurrent, totalCount)
+        let initialCap = min(initialConcurrent, totalCount)
+        let minCap = min(minConcurrent, max(1, totalCount))
+        let maxCap = min(maxConcurrentCap, totalCount)
 
         let timeout = watchdogTimeout
         watchdog = Task { [weak self] in
@@ -96,14 +100,50 @@ final class RefreshCoordinator {
             let appleService = AppleMusicReleaseService()
             let spotifyService = SpotifyService()
 
+            // Compute incremental-fetch window from the last successful refresh.
+            // First refresh ever → nil (full default window). Otherwise pass
+            // days-since-last-refresh; the service tacks on a 3-day buffer.
+            let lastSuccess = UserDefaults.standard.double(forKey: AppSettings.lastSuccessfulRefreshAt)
+            let daysSinceLastRefresh: Int? = {
+                guard lastSuccess > 0 else { return nil }
+                let elapsedSeconds = Date().timeIntervalSince1970 - lastSuccess
+                guard elapsedSeconds > 0 else { return nil }
+                return max(1, Int(elapsedSeconds / 86_400))
+            }()
+            if let days = daysSinceLastRefresh {
+                Log.v("[Refresh] incremental window: \(days) days since last refresh")
+            } else {
+                Log.v("[Refresh] first refresh — using full default window")
+            }
+
+            // Kick off videos + concerts fetches in parallel with releases so the
+            // network legs overlap. They were previously sequential (videos after
+            // releases, then concerts after videos), which left the progress bar
+            // sitting on indeterminate spinners for the whole tail of the refresh.
+            let videosEnabled = UserDefaults.standard.object(forKey: AppSettings.enableVideosTab) as? Bool ?? false
+            let concertsEnabled = UserDefaults.standard.object(forKey: AppSettings.enableConcertsTab) as? Bool ?? false
+            let videoInputs = videosEnabled ? inputs.filter { $0.kind != "label" } : []
+            async let videoFetchTask: [FetchedVideo] = videosEnabled
+                ? AppleMusicVideoService().fetchVideos(for: videoInputs)
+                : []
+            async let concertFetchTask: [FetchedConcert] = concertsEnabled
+                ? BandsintownService().fetchConcerts(for: inputs)
+                : []
+
             // Speed win: batch-resolve all cached catalog IDs in one call (chunked by 25)
             // instead of doing a separate network round-trip per artist.
             let appleInputs = inputs.filter { MusicProvider.fromStoredName($0.provider) == .appleMusic }
             let cachedIDs = appleInputs.compactMap { $0.catalogArtistID }.filter { !$0.isEmpty }
             Log.v("[Refresh] apple=\(appleInputs.count), cachedIDs=\(cachedIDs.count), about to preResolve")
             let preResolveStart = Date()
-            let preResolved = await appleService.preResolveCachedArtists(catalogIDs: cachedIDs)
-            Log.v("[Refresh] preResolve done in \(String(format: "%.2f", Date().timeIntervalSince(preResolveStart)))s, resolved=\(preResolved.count)")
+            // Pre-resolve cached artists *and* the storefront concurrently.
+            // Storefront used to be re-fetched ~2× per artist inside the REST
+            // helpers; resolving once here saves N round-trips on every refresh.
+            async let preResolvedTask = appleService.preResolveCachedArtists(catalogIDs: cachedIDs)
+            async let storefrontTask = appleService.resolveStorefrontCountryCode()
+            let preResolved = await preResolvedTask
+            let storefront = await storefrontTask
+            Log.v("[Refresh] preResolve done in \(String(format: "%.2f", Date().timeIntervalSince(preResolveStart)))s, resolved=\(preResolved.count), storefront=\(storefront)")
 
             var collected: [FetchedRelease] = []
             var failures: [String] = []
@@ -114,6 +154,10 @@ final class RefreshCoordinator {
 
             await withTaskGroup(of: ArtistFetchOutcome.self) { group in
                 var nextIndex = 0
+                var inFlight = 0
+                // AIMD state. Halve cap on rate-limit; +1 every 10 clean outcomes.
+                var currentCap = initialCap
+                var cleanStreak = 0
 
                 func enqueue(_ index: Int) {
                     let input = inputs[index]
@@ -123,26 +167,33 @@ final class RefreshCoordinator {
                         let outcome: ArtistFetchOutcome
                         switch MusicProvider.fromStoredName(input.provider) {
                         case .appleMusic:
-                            outcome = await appleService.fetchOne(input, preResolvedArtist: cached)
+                            outcome = await appleService.fetchOne(
+                                input,
+                                preResolvedArtist: cached,
+                                storefront: storefront,
+                                daysSinceLastRefresh: daysSinceLastRefresh
+                            )
                         case .spotify:
                             outcome = await spotifyService.fetchOne(input)
                         }
                         let elapsed = Date().timeIntervalSince(started)
                         if elapsed > 5 || outcome.errorMessage != nil {
-                            Log.v("[Refresh] fetchOne(\(input.name)) elapsed=\(String(format: "%.2f", elapsed))s, releases=\(outcome.releases.count), error=\(outcome.errorMessage ?? "nil")")
+                            Log.v("[Refresh] fetchOne(\(input.name)) elapsed=\(String(format: "%.2f", elapsed))s, releases=\(outcome.releases.count), error=\(outcome.errorMessage ?? "nil"), rateLimited=\(outcome.wasRateLimited)")
                         }
                         return outcome
                     }
                 }
 
-                while nextIndex < min(concurrent, totalCount) {
+                while nextIndex < currentCap && nextIndex < totalCount {
                     enqueue(nextIndex)
+                    inFlight += 1
                     nextIndex += 1
                 }
 
                 while let outcome = await group.next() {
                     if Task.isCancelled { break }
 
+                    inFlight -= 1
                     checkedCount += 1
                     collected.append(contentsOf: outcome.releases)
                     if let catID = outcome.catalogArtistID {
@@ -155,9 +206,24 @@ final class RefreshCoordinator {
                         failures.append("\(outcome.input.name): \(err)")
                     }
 
+                    // AIMD update: detected rate-limit halves the cap; ten
+                    // clean outcomes in a row bump it back up by one. Keeps
+                    // throughput high when Apple is healthy, backs off fast
+                    // when capacity tightens.
+                    if outcome.wasRateLimited {
+                        currentCap = max(minCap, currentCap / 2)
+                        cleanStreak = 0
+                        Log.v("[Refresh] rate-limit detected → cap=\(currentCap)")
+                    } else {
+                        cleanStreak += 1
+                        if cleanStreak >= 10 && currentCap < maxCap {
+                            currentCap += 1
+                            cleanStreak = 0
+                            Log.v("[Refresh] cap bumped → \(currentCap)")
+                        }
+                    }
+
                     // Throttle progress updates to at most one every 150ms (plus final).
-                    // Without this the MainActor gets spammed with progress micro-tasks
-                    // when many fetches complete near-simultaneously.
                     let now = Date()
                     let isFinal = checkedCount == totalCount
                     if isFinal || now.timeIntervalSince(lastProgressDispatch) > 0.15 {
@@ -175,8 +241,11 @@ final class RefreshCoordinator {
                         }
                     }
 
-                    if nextIndex < totalCount && !Task.isCancelled {
+                    // Re-fill up to current cap. May enqueue 0 (cap dropped),
+                    // 1 (steady), or 2 (cap just bumped after this outcome).
+                    while inFlight < currentCap && nextIndex < totalCount && !Task.isCancelled {
                         enqueue(nextIndex)
+                        inFlight += 1
                         nextIndex += 1
                     }
                 }
@@ -214,20 +283,11 @@ final class RefreshCoordinator {
                 notificationMinute: notificationMinute
             )
 
-            // Videos pass — only runs when the user has opted in via Settings.
-            // Uses the catalog artist IDs that release refresh just resolved.
-            let videosEnabled = UserDefaults.standard.object(forKey: AppSettings.enableVideosTab) as? Bool ?? false
-            let concertsEnabled = UserDefaults.standard.object(forKey: AppSettings.enableConcertsTab) as? Bool ?? false
-
-            // Phase-aware sequential tail. Releases are done; videos+concerts now show
-            // their own phase label on the progress bar instead of leaving it frozen at
-            // 100% — that's the symptom of "considerable time stuck loading" the user hit.
-            //
-            // We *don't* parallelize videos+concerts at this layer: ArtistData and
-            // ModelContext aren't Sendable, and wrapping the @MainActor service calls in
-            // async-let closures captures them across an isolated boundary (Swift 6 warning).
-            // The bigger parallelism wins live inside each service (intra-videos parallel
-            // already done in AppleMusicVideoService).
+            // Videos + concerts: the network fetches already ran in parallel
+            // with the release fetch (see async let above). Now we just await
+            // the results and hand them to the @MainActor apply step. Because
+            // the fetch is already done, the "Looking for new videos…" phase
+            // is typically near-instant instead of the 5–10s it used to take.
             if videosEnabled && !Task.isCancelled {
                 await MainActor.run { [weak self] in
                     self?.progress = ReleaseRefreshProgress(
@@ -238,9 +298,11 @@ final class RefreshCoordinator {
                         isIndeterminate: true
                     )
                 }
+                let prefetchedVideos = await videoFetchTask
                 _ = await VideoRefreshService().refresh(
                     trackedArtists: trackedArtists,
-                    modelContext: modelContext
+                    modelContext: modelContext,
+                    prefetched: prefetchedVideos
                 )
             }
             if concertsEnabled && !Task.isCancelled {
@@ -253,9 +315,11 @@ final class RefreshCoordinator {
                         isIndeterminate: true
                     )
                 }
+                let prefetchedConcerts = await concertFetchTask
                 _ = await ConcertRefreshService().refresh(
                     trackedArtists: trackedArtists,
-                    modelContext: modelContext
+                    modelContext: modelContext,
+                    prefetched: prefetchedConcerts
                 )
             }
 
@@ -304,9 +368,36 @@ final class RefreshCoordinator {
 
     /// Toggles the App Group flag the widget checks to decide whether to render its
     /// "refreshing now" indicator, then nudges WidgetKit to redraw soon.
+    ///
+    /// `reloadAllTimelines` is throttled — back-to-back calls (start-of-refresh,
+    /// end-of-refresh, plus any intermediate writes) were hammering WidgetKit
+    /// and contributing to visible main-actor stalls during refresh. End-of-
+    /// refresh (when `isRefreshing == false`) always reloads since the data
+    /// just changed; start-of-refresh reloads at most once per 5s.
+    private static let widgetReloadInterval: TimeInterval = 5
+    nonisolated(unsafe) private static var lastWidgetReload: Date = .distantPast
+    private static let widgetReloadLock = NSLock()
+
     static func setWidgetRefreshFlag(_ isRefreshing: Bool) {
         UserDefaults(suiteName: AppSettings.appGroupIdentifier)?
             .set(isRefreshing, forKey: "appIsRefreshing")
-        WidgetCenter.shared.reloadAllTimelines()
+
+        let now = Date()
+        let shouldReload: Bool
+        widgetReloadLock.lock()
+        if !isRefreshing {
+            // End-of-refresh: always reload — the data the widget renders just changed.
+            lastWidgetReload = now
+            shouldReload = true
+        } else if now.timeIntervalSince(lastWidgetReload) >= widgetReloadInterval {
+            lastWidgetReload = now
+            shouldReload = true
+        } else {
+            shouldReload = false
+        }
+        widgetReloadLock.unlock()
+        if shouldReload {
+            WidgetCenter.shared.reloadAllTimelines()
+        }
     }
 }

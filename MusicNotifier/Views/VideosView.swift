@@ -28,20 +28,45 @@ struct VideosView: View {
     }
 
     private var filteredVideos: [VideoData] {
+        // Drop dismissed videos so they stop holding feed real estate. The
+        // SwiftData rows are kept around (so CloudKit mirrors the choice)
+        // but never appear in the UI again.
+        let live = videos.filter { $0.dismissedAt == nil }
         let kindFiltered: [VideoData]
         switch filter {
-        case .all: kindFiltered = videos
-        case .musicVideos: kindFiltered = videos.filter { VideoKind(rawValue: $0.kind) == .musicVideo }
-        case .interviews: kindFiltered = videos.filter { VideoKind(rawValue: $0.kind) == .interview }
+        case .all: kindFiltered = live
+        case .musicVideos: kindFiltered = live.filter { VideoKind(rawValue: $0.kind) == .musicVideo }
+        case .interviews: kindFiltered = live.filter { VideoKind(rawValue: $0.kind) == .interview }
         }
-        guard !searchText.trimmingCharacters(in: .whitespaces).isEmpty else { return kindFiltered }
-        let needle = searchText.lowercased()
-        return kindFiltered.filter {
-            $0.title.lowercased().contains(needle) || $0.artistName.lowercased().contains(needle)
+        // Re-sort explicitly. SwiftData's `@Query(sort: \.releaseDate, .reverse)`
+        // puts nil dates FIRST when the column is optional, which is what
+        // surfaces a March video above June: anything missing a parsed date
+        // floats to position 0. Sort dated videos newest-first, then push
+        // undated ones to the end.
+        let searched: [VideoData]
+        if searchText.trimmingCharacters(in: .whitespaces).isEmpty {
+            searched = kindFiltered
+        } else {
+            let needle = searchText.lowercased()
+            searched = kindFiltered.filter {
+                $0.title.lowercased().contains(needle) || $0.artistName.lowercased().contains(needle)
+            }
+        }
+        return searched.sorted { a, b in
+            switch (a.releaseDate, b.releaseDate) {
+            case let (.some(l), .some(r)): return l > r
+            case (.some, .none): return true
+            case (.none, .some): return false
+            case (.none, .none): return false
+            }
         }
     }
 
-    private var featured: VideoData? { filteredVideos.first { !$0.isSeen } ?? filteredVideos.first }
+    // Featured = newest video by releaseDate, not "latest unseen". Picking
+    // by unseen meant a March release stayed featured for weeks just because
+    // the user had tapped into the June one — the headline card should always
+    // reflect the latest content, with a separate "unseen" badge if needed.
+    private var featured: VideoData? { filteredVideos.first }
 
     private var rest: [VideoData] {
         guard let f = featured else { return [] }
@@ -115,6 +140,7 @@ struct VideosView: View {
                                 }
                             }
                         }
+                        endOfListFooter
                     }
                 }
                 .padding(.top, 4)
@@ -128,24 +154,46 @@ struct VideosView: View {
         .tint(AppTheme.accent)
     }
 
+    private var endOfListFooter: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "checkmark.circle")
+                .font(.title3)
+                .foregroundStyle(AppTheme.secondary.opacity(0.7))
+            Text("You're caught up")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(AppTheme.secondary)
+            Text("\(filteredVideos.count) video\(filteredVideos.count == 1 ? "" : "s") shown")
+                .font(.caption)
+                .foregroundStyle(AppTheme.secondary.opacity(0.7))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 18)
+    }
+
     private var filterRow: some View {
         HStack(spacing: 8) {
             ForEach(VideoFilter.allCases) { option in
                 Button {
-                    withAnimation(.easeInOut(duration: 0.18)) { filter = option }
+                    // No `withAnimation` — cross-fading the featured card
+                    // and section reflow at once layered old/new posters on
+                    // top of each other for the duration of the transition.
+                    filter = option
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: option.icon)
                             .font(.caption.weight(.bold))
                         Text(option.rawValue)
-                            .font(.footnote.weight(.semibold))
+                            .font(.footnote.weight(filter == option ? .bold : .semibold))
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 9)
                     .background(
-                        Capsule().fill(filter == option ? Color.white.opacity(0.95) : AppTheme.elevatedSurface)
+                        Capsule().fill(filter == option ? AppTheme.primaryText : AppTheme.elevatedSurface)
                     )
-                    .foregroundStyle(filter == option ? AppTheme.background : AppTheme.secondary)
+                    .overlay(
+                        Capsule().stroke(filter == option ? Color.clear : AppTheme.hairline, lineWidth: 1)
+                    )
+                    .foregroundStyle(filter == option ? AppTheme.background : AppTheme.primaryText.opacity(0.85))
                 }
                 .buttonStyle(.plain)
             }
@@ -178,6 +226,7 @@ struct VideosView: View {
 
     @ViewBuilder
     private func videoContextMenu(_ video: VideoData) -> some View {
+        // Order: primary → share → state action → destructive (last).
         if let url = video.videoURL {
             Button {
                 UIApplication.shared.open(url)
@@ -188,13 +237,19 @@ struct VideosView: View {
                 Label("Share", systemImage: "square.and.arrow.up")
             }
         }
-        Divider()
         Button {
             video.isSeen.toggle()
             try? modelContext.save()
         } label: {
             Label(video.isSeen ? "Mark unseen" : "Mark seen",
                   systemImage: video.isSeen ? "circle" : "checkmark.circle")
+        }
+        Divider()
+        Button(role: .destructive) {
+            video.dismissedAt = Date()
+            try? modelContext.save()
+        } label: {
+            Label("Dismiss", systemImage: "xmark")
         }
     }
 

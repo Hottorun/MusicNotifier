@@ -33,6 +33,11 @@ class VideoData {
     var discoveredAt: Date = Date()
     var notifiedAt: Date?
     var isSeen: Bool = false
+    /// Set when the user swipes/menu-dismisses the video so it stops
+    /// occupying feed real estate (mirrors `ReleaseData.dismissedAt`). The
+    /// row is filtered out of the Videos tab once non-nil but the model is
+    /// kept so CloudKit can mirror the decision across devices.
+    var dismissedAt: Date?
 
     init(
         providerID: String,

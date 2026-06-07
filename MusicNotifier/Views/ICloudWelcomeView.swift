@@ -11,9 +11,9 @@ import SwiftUI
 import SwiftData
 
 struct ICloudWelcomeView: View {
-    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
     let artistCount: Int
     let trackedCount: Int
+    let onContinue: () -> Void
     let onStartFresh: () -> Void
 
     var body: some View {
@@ -52,7 +52,7 @@ struct ICloudWelcomeView: View {
 
             VStack(spacing: 12) {
                 Button {
-                    hasCompletedOnboarding = true
+                    onContinue()
                 } label: {
                     Label("Continue", systemImage: "arrow.forward")
                 }

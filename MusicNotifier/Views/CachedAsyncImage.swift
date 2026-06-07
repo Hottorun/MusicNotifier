@@ -26,15 +26,28 @@ final class ImageCache {
 
     private let cache: NSCache<NSURL, UIImage> = {
         let cache = NSCache<NSURL, UIImage>()
-        // 800 covers easily fits a substantial library; each ~200x200 decoded
-        // image is well under 200KB so worst-case memory is bounded.
-        cache.countLimit = 800
+        // Cost-based eviction (bytes of decoded RGBA) is much safer than a
+        // raw `countLimit`: an @3x cover at 600×600 is ~1.4 MB, and 800 of
+        // those would push 1 GB on devices like the iPhone 11 — the OS
+        // would terminate us under memory pressure long before. Cap at
+        // ~100 MB of decoded artwork.
+        cache.totalCostLimit = 100 * 1024 * 1024
         return cache
     }()
 
     func image(for url: URL) -> UIImage? { cache.object(forKey: url as NSURL) }
-    func store(_ image: UIImage, for url: URL) { cache.setObject(image, forKey: url as NSURL) }
+    func store(_ image: UIImage, for url: URL) {
+        // Approximate decoded byte cost: width × height × 4 bytes (RGBA).
+        let scale = image.scale
+        let pixelWidth = image.size.width * scale
+        let pixelHeight = image.size.height * scale
+        let cost = Int(pixelWidth * pixelHeight * 4)
+        cache.setObject(image, forKey: url as NSURL, cost: max(cost, 1))
+    }
 }
+
+// NB: a 256 MB on-disk URLCache is installed in `MusicNotifierApp.init()` so
+// cold launches paint cached covers from disk instead of re-downloading.
 
 /// Tracks in-flight downloads so concurrent prefetches/views for the same URL
 /// don't trigger duplicate network calls. The first caller fetches; everyone

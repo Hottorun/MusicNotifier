@@ -47,19 +47,74 @@ struct HomeView: View {
     /// a fresh O(N) walk over the tracked roster.
     @State private var trackedArtistIDs: Set<String> = []
     @State private var labelArtistIDs: Set<String> = []
+    /// providerID → tracked artist name. Used by the row to surface a
+    /// "via <name>" hint when a release's credited artist string doesn't
+    /// already mention the artist the user follows (typical for features /
+    /// collabs where the tracked artist is buried later in the credits).
+    @State private var trackedArtistNamesByID: [String: String] = [:]
 
     private func refreshTrackedSets() {
         var tracked: Set<String> = []
         var labels: Set<String> = []
+        var names: [String: String] = [:]
         for artist in trackedArtists {
             tracked.insert(artist.providerID)
+            names[artist.providerID] = artist.name
             if artist.kind == "label" { labels.insert(artist.providerID) }
         }
         if tracked != trackedArtistIDs { trackedArtistIDs = tracked }
         if labels != labelArtistIDs { labelArtistIDs = labels }
+        if names != trackedArtistNamesByID { trackedArtistNamesByID = names }
+    }
+
+    /// Returns the tracked artist's name when the credited string doesn't
+    /// already make it obvious. Suppressed in two cases:
+    ///   1. Solo release — credited string equals the tracked artist's name.
+    ///   2. Pure tracked-only collab — every artist mentioned in the credit
+    ///      ("Trevor Spitta & Keshore") is one the user already follows, so
+    ///      there's no disambiguation left to do.
+    /// Shown otherwise — including collabs where one credit is tracked and
+    /// another isn't ("Katy Perry & Chief Keef" with only Chief Keef tracked).
+    private func viaTrackedArtistName(for release: ReleaseData) -> String? {
+        guard let name = trackedArtistNamesByID[release.artistProviderID] else { return nil }
+        let credited = release.artistName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if credited.caseInsensitiveCompare(name) == .orderedSame { return nil }
+        if allCreditedArtistsTracked(credited) { return nil }
+        return name
+    }
+
+    /// Splits a credited-artist string into components and checks whether
+    /// every component matches a tracked artist's name. Splitters cover the
+    /// common Apple Music conventions: " & ", ", ", " feat. ", " ft. ",
+    /// " featuring ", " x ", " X ", " and ", and parenthetical "(feat. ...)"
+    /// suffixes (which we strip before splitting).
+    private func allCreditedArtistsTracked(_ credited: String) -> Bool {
+        var working = credited
+        // Strip "(feat. X)" / "[feat. X]" / "(with X)" — keeps the primary
+        // credit list clean before we split on ampersand/comma.
+        let parens = #"\s*[\(\[](?:feat\.?|featuring|with)\s[^\)\]]+[\)\]]"#
+        if let regex = try? NSRegularExpression(pattern: parens, options: [.caseInsensitive]) {
+            let range = NSRange(working.startIndex..., in: working)
+            working = regex.stringByReplacingMatches(in: working, options: [], range: range, withTemplate: "")
+        }
+        let separators: [String] = [" & ", ", ", " feat. ", " ft. ", " featuring ", " x ", " X ", " and "]
+        var pieces: [String] = [working]
+        for sep in separators {
+            pieces = pieces.flatMap { $0.components(separatedBy: sep) }
+        }
+        let trimmed = pieces
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !trimmed.isEmpty else { return false }
+        let trackedNames = Set(trackedArtistNamesByID.values.map { $0.lowercased() })
+        for piece in trimmed where !trackedNames.contains(piece.lowercased()) {
+            return false
+        }
+        return true
     }
     @Query(sort: \ReleaseData.firstSeenAt, order: .reverse) private var storedReleases: [ReleaseData]
     @AppStorage(AppSettings.autoRefreshOnLaunch) private var autoRefreshOnLaunch = true
+    @AppStorage(AppSettings.lastSuccessfulRefreshAt) private var lastSuccessfulRefreshAt: Double = 0
     @AppStorage(AppSettings.releaseNotificationHour) private var releaseNotificationHour = 8
     @AppStorage(AppSettings.releaseNotificationMinute) private var releaseNotificationMinute = 0
     @AppStorage(AppSettings.homeReleaseKindFilter) private var releaseKindFilterRaw = ReleaseKindFilter.all.rawValue
@@ -79,8 +134,6 @@ struct HomeView: View {
     @State private var hasAutoRefreshed = false
     @State private var showingSettings = false
     @State private var showingRefreshDetail = false
-    @State private var pullTriggered = false
-    @State private var scrollAtTop = true
     @State private var releaseSearchText = ""
     /// Debounced mirror of releaseSearchText. `derived` reads this instead of the
     /// raw search text so the (potentially thousands of releases) filter loop
@@ -88,10 +141,12 @@ struct HomeView: View {
     @State private var debouncedSearchText = ""
     @State private var searchDebounceTask: Task<Void, Never>?
     @State private var showingMarkAllConfirm = false
-    @State private var isSearchPresented = false
-    /// Focus state for the custom inline search field. Bound via @FocusState so
-    /// we can pop the keyboard the instant the user taps the toolbar magnifier.
-    @FocusState private var searchFieldFocused: Bool
+    /// Past releases default to the most recent 3 month buckets so feeds with
+    /// hundreds of stored releases don't render every row up-front (the
+    /// non-lazy outer VStack means rows are instantiated eagerly). User taps
+    /// "Show older" to expand the rest.
+    @State private var showAllPastMonths = false
+    private let defaultPastMonthCount = 2
 
     private var feedFilter: ReleaseFeedFilter {
         ReleaseFeedFilter(rawValue: feedFilterRaw) ?? .releases
@@ -160,50 +215,192 @@ struct HomeView: View {
         )
     }
 
+    /// Sendable projection used for the off-main filter+sort. Carries only the
+    /// scalar properties the derivation reads — no `@Model` references cross
+    /// the actor boundary.
+    private struct ReleaseSnapshot: Sendable {
+        let id: PersistentIdentifier
+        let artistProviderID: String
+        let title: String
+        let artistName: String
+        let releaseDate: Date?
+        let firstSeenAt: Date
+        let isUpcoming: Bool
+        let isSeen: Bool
+        let isDismissed: Bool
+        let hasUnknownReleaseDate: Bool
+        let kind: ReleaseKind
+    }
+
+    /// Bucketed IDs produced off-main; resolved back to `ReleaseData` on MainActor.
+    private struct DerivedIDs: Sendable {
+        var newReleaseIDs: [PersistentIdentifier] = []
+        var pastAndSeenIDs: [PersistentIdentifier] = []
+        var unknownDateIDs: [PersistentIdentifier] = []
+        var upcomingCount = 0
+        var unreadCount = 0
+        var visibleCount = 0
+        var hasAnyTrackedRelease = false
+    }
+
     private func computeDerived() -> DerivedReleases {
+        // Snapshot inputs on MainActor (cheap scalar reads), then run the
+        // filter + sort on a detached executor so the main thread isn't
+        // tied up walking thousands of releases on large libraries.
+        let snapshots = storedReleases.map { release in
+            ReleaseSnapshot(
+                id: release.persistentModelID,
+                artistProviderID: release.artistProviderID,
+                title: release.title,
+                artistName: release.artistName,
+                releaseDate: release.releaseDate,
+                firstSeenAt: release.firstSeenAt,
+                isUpcoming: release.isUpcoming,
+                isSeen: release.isSeen,
+                isDismissed: release.dismissedAt != nil,
+                hasUnknownReleaseDate: release.hasUnknownReleaseDate,
+                kind: release.kind
+            )
+        }
         let ids = trackedArtistIDs
         let trimmedSearch = debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let kindFilter = releaseKindFilter
+        let visibleKinds = visibleKindsSet()
+
+        let derivedIDs = Self.computeDerivedIDsSync(
+            snapshots: snapshots,
+            trackedIDs: ids,
+            trimmedSearch: trimmedSearch,
+            kindFilter: kindFilter,
+            visibleKinds: visibleKinds
+        )
+
+        // Resolve IDs back to ReleaseData references — single dict build,
+        // then O(1) lookups. Cheaper than re-walking storedReleases per bucket.
+        let lookup = Dictionary(storedReleases.map { ($0.persistentModelID, $0) }, uniquingKeysWith: { lhs, _ in lhs })
         var out = DerivedReleases()
+        out.upcomingCount = derivedIDs.upcomingCount
+        out.unreadCount = derivedIDs.unreadCount
+        out.visibleCount = derivedIDs.visibleCount
+        out.hasAnyTrackedRelease = derivedIDs.hasAnyTrackedRelease
+        out.newReleases = derivedIDs.newReleaseIDs.compactMap { lookup[$0] }
+        out.pastAndSeen = derivedIDs.pastAndSeenIDs.compactMap { lookup[$0] }
+        out.unknownDate = derivedIDs.unknownDateIDs.compactMap { lookup[$0] }
+        return out
+    }
 
-        for release in storedReleases {
-            guard ids.contains(release.artistProviderID) else { continue }
+    /// Async variant — actually moves the filter+sort off MainActor. Used by
+    /// `.task(id:)`; the sync wrapper above stays available for the call sites
+    /// (context menu) that want immediate cache refresh after a toggle.
+    private func computeDerivedAsync() async -> DerivedReleases {
+        let snapshots = storedReleases.map { release in
+            ReleaseSnapshot(
+                id: release.persistentModelID,
+                artistProviderID: release.artistProviderID,
+                title: release.title,
+                artistName: release.artistName,
+                releaseDate: release.releaseDate,
+                firstSeenAt: release.firstSeenAt,
+                isUpcoming: release.isUpcoming,
+                isSeen: release.isSeen,
+                isDismissed: release.dismissedAt != nil,
+                hasUnknownReleaseDate: release.hasUnknownReleaseDate,
+                kind: release.kind
+            )
+        }
+        let ids = trackedArtistIDs
+        let trimmedSearch = debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let kindFilter = releaseKindFilter
+        let visibleKinds = visibleKindsSet()
+
+        let derivedIDs = await Task.detached(priority: .userInitiated) {
+            Self.computeDerivedIDsSync(
+                snapshots: snapshots,
+                trackedIDs: ids,
+                trimmedSearch: trimmedSearch,
+                kindFilter: kindFilter,
+                visibleKinds: visibleKinds
+            )
+        }.value
+
+        let lookup = Dictionary(storedReleases.map { ($0.persistentModelID, $0) }, uniquingKeysWith: { lhs, _ in lhs })
+        var out = DerivedReleases()
+        out.upcomingCount = derivedIDs.upcomingCount
+        out.unreadCount = derivedIDs.unreadCount
+        out.visibleCount = derivedIDs.visibleCount
+        out.hasAnyTrackedRelease = derivedIDs.hasAnyTrackedRelease
+        out.newReleases = derivedIDs.newReleaseIDs.compactMap { lookup[$0] }
+        out.pastAndSeen = derivedIDs.pastAndSeenIDs.compactMap { lookup[$0] }
+        out.unknownDate = derivedIDs.unknownDateIDs.compactMap { lookup[$0] }
+        return out
+    }
+
+    /// Pure value-type walk — safe to run off any actor. Filters, buckets,
+    /// and sorts the snapshot list using the same rules the inline path used.
+    nonisolated private static func computeDerivedIDsSync(
+        snapshots: [ReleaseSnapshot],
+        trackedIDs: Set<String>,
+        trimmedSearch: String,
+        kindFilter: ReleaseKindFilter,
+        visibleKinds: Set<ReleaseKind>
+    ) -> DerivedIDs {
+        var out = DerivedIDs()
+        var newSnaps: [ReleaseSnapshot] = []
+        var pastSnaps: [ReleaseSnapshot] = []
+        var unknownSnaps: [ReleaseSnapshot] = []
+
+        for s in snapshots {
+            guard trackedIDs.contains(s.artistProviderID) else { continue }
             out.hasAnyTrackedRelease = true
-            if release.isUpcoming { out.upcomingCount += 1 }
-            if !release.isSeen && release.dismissedAt == nil { out.unreadCount += 1 }
+            if s.isUpcoming { out.upcomingCount += 1 }
+            if !s.isSeen && !s.isDismissed { out.unreadCount += 1 }
 
-            // Below this point: visible-feed filtering.
-            guard release.dismissedAt == nil else { continue }
-            guard !release.isUpcoming else { continue }
-            guard kindIsGloballyVisible(release.kind) else { continue }
-            guard releaseMatchesKindFilter(release, filter: kindFilter) else { continue }
+            guard !s.isDismissed else { continue }
+            guard !s.isUpcoming else { continue }
+            guard visibleKinds.contains(s.kind) else { continue }
+            guard releaseMatchesKindFilterStatic(s.kind, filter: kindFilter) else { continue }
             if !trimmedSearch.isEmpty {
-                let inTitle = release.title.localizedCaseInsensitiveContains(trimmedSearch)
-                let inArtist = release.artistName.localizedCaseInsensitiveContains(trimmedSearch)
+                let inTitle = s.title.localizedCaseInsensitiveContains(trimmedSearch)
+                let inArtist = s.artistName.localizedCaseInsensitiveContains(trimmedSearch)
                 if !inTitle && !inArtist { continue }
             }
 
             out.visibleCount += 1
-            if release.hasUnknownReleaseDate {
-                out.unknownDate.append(release)
-            } else if !release.isSeen {
-                // Any unseen release — including past ones the user just
-                // toggled back to unseen — surfaces in the top bucket.
-                out.newReleases.append(release)
-            } else {
-                out.pastAndSeen.append(release)
-            }
+            if s.hasUnknownReleaseDate { unknownSnaps.append(s) }
+            else if !s.isSeen { newSnaps.append(s) }
+            else { pastSnaps.append(s) }
         }
 
-        // Sort each bucket once. storedReleases is itself sorted by firstSeenAt
-        // desc, but we want releaseDate-desc presentation throughout the feed.
-        let sortDesc: (ReleaseData, ReleaseData) -> Bool = { lhs, rhs in
+        let sortDesc: (ReleaseSnapshot, ReleaseSnapshot) -> Bool = { lhs, rhs in
             (lhs.releaseDate ?? lhs.firstSeenAt) > (rhs.releaseDate ?? rhs.firstSeenAt)
         }
-        out.newReleases.sort(by: sortDesc)
-        out.pastAndSeen.sort(by: sortDesc)
-        out.unknownDate.sort(by: sortDesc)
+        newSnaps.sort(by: sortDesc)
+        pastSnaps.sort(by: sortDesc)
+        unknownSnaps.sort(by: sortDesc)
+        out.newReleaseIDs = newSnaps.map(\.id)
+        out.pastAndSeenIDs = pastSnaps.map(\.id)
+        out.unknownDateIDs = unknownSnaps.map(\.id)
         return out
+    }
+
+    nonisolated private static func releaseMatchesKindFilterStatic(_ kind: ReleaseKind, filter: ReleaseKindFilter) -> Bool {
+        switch filter {
+        case .all: return true
+        case .albums: return kind == .album || kind == .compilation || kind == .liveAlbum
+        case .eps: return kind == .ep
+        case .singles: return kind == .single || kind == .remix
+        }
+    }
+
+    private func visibleKindsSet() -> Set<ReleaseKind> {
+        var set: Set<ReleaseKind> = []
+        if showAlbums { set.insert(.album) }
+        if showSingles { set.insert(.single) }
+        if showEPs { set.insert(.ep) }
+        if showLiveAlbums { set.insert(.liveAlbum) }
+        if showCompilations { set.insert(.compilation) }
+        if showRemixes { set.insert(.remix) }
+        return set
     }
 
     private var releaseKindFilter: ReleaseKindFilter {
@@ -217,13 +414,13 @@ struct HomeView: View {
         let derived = cachedDerived
         return NavigationStack {
             ScrollView {
-                VStack(spacing: 16) {
+                // LazyVStack so only the on-screen sections of the feed
+                // (header, hero, current month) are instantiated when the
+                // tab appears. On a large library the eager VStack here was
+                // building hundreds of release rows before SwiftUI could
+                // swap tabs, causing the multi-second tab-switch freeze.
+                LazyVStack(spacing: 16) {
                     header(derived: derived)
-
-                    if isSearchPresented {
-                        inlineSearchField
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                    }
 
                     // Only surface the refresh message when it represents a failure that
                     // the user can retry. Success summaries ("Checked 83/83… Found N") are
@@ -297,8 +494,13 @@ struct HomeView: View {
                 }
                 .padding(.top, 4)
             }
-            .navigationTitle("")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Feed")
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    headerActionButtons(derived: derived)
+                }
+            }
             .appScreenBackground()
             // Value-based navigation so AlbumView (with its @StateObject preview
             // player and queries) is only instantiated when the user actually
@@ -306,9 +508,9 @@ struct HomeView: View {
             .navigationDestination(for: ReleaseData.self) { release in
                 AlbumView(release: release)
             }
-            // `.searchable` had a built-in pull-down-at-top reveal behavior we
-            // can't disable — see custom `inlineSearchField` below for the
-            // toolbar-button-controlled replacement.
+            // System search bar — hidden at rest, revealed by a pull-down
+            // gesture at the top of the scroll view (matches Videos tab).
+            .searchable(text: $releaseSearchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search releases")
             .onChange(of: trackedArtists.count) { _, _ in refreshTrackedSets() }
             .onAppear {
                 refreshTrackedSets()
@@ -332,51 +534,27 @@ struct HomeView: View {
                     debouncedSearchText = newValue
                 }
             }
-            .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                // contentOffset.y stays clamped at the top in SwiftUI's ScrollView during
-                // rubber-band, so we only use it to tell whether the user is *resting* at top.
-                geometry.contentOffset.y
-            } action: { _, newOffset in
-                scrollAtTop = newOffset < 12
-                if newOffset > 40 { pullTriggered = false }
-                // Auto-hide the search bar once the user scrolls away from
-                // the top. Without this the bar stayed visible forever after
-                // the first pull-down reveal. Only collapses when the field
-                // is empty so we don't dismiss mid-query.
-                if newOffset > 80 && isSearchPresented && releaseSearchText.isEmpty {
-                    isSearchPresented = false
-                }
+            // Standard `.refreshable` integrates cleanly with `.searchable`
+            // and gives the user the platform pull-to-refresh affordance.
+            // The previous custom DragGesture raced with the search bar's
+            // pull-to-reveal — overloading the same gesture for both made
+            // the search field surface unintentionally during pulls.
+            .refreshable {
+                guard !refreshCoordinator.isRefreshing, !trackedArtists.isEmpty else { return }
+                startRefresh()
+                // Hold the system spinner briefly so the user feels the gesture
+                // landed even though our refresh runs detached.
+                try? await Task.sleep(nanoseconds: 800_000_000)
             }
-            .simultaneousGesture(
-                // Pure pull-to-refresh. Search now lives behind a toolbar
-                // magnifying-glass tap (predictable + matches the Artists
-                // tab); overloading the same gesture for both was making
-                // the search bar appear unintentionally.
-                DragGesture(minimumDistance: 20)
-                    .onChanged { value in
-                        guard scrollAtTop,
-                              !pullTriggered,
-                              !refreshCoordinator.isRefreshing,
-                              !trackedArtists.isEmpty,
-                              value.translation.height > 120 else { return }
-                        pullTriggered = true
-                        startRefresh()
-                    }
-                    .onEnded { _ in
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            pullTriggered = false
-                        }
-                    }
-            )
             .task(id: derivedKey) {
                 // Defer the heavy `derived` walk until after the body's first
-                // frame has rendered. Without this the @Query invalidations
-                // triggered at refresh phase transitions (every time the
-                // background actor saves and storedReleases.count changes)
-                // would run the O(N) walk on the main thread inline before
-                // SwiftUI could paint, producing visible frame hitches.
+                // frame has rendered, then run it off-MainActor entirely
+                // (via `computeDerivedAsync`). The detached executor walks
+                // the Sendable snapshot list and returns bucketed IDs; we
+                // only resolve back to `ReleaseData` refs on main.
                 await Task.yield()
-                cachedDerived = computeDerived()
+                let next = await computeDerivedAsync()
+                cachedDerived = next
             }
             .task {
                 // Warm the artwork cache for everything visible — by the time the
@@ -402,9 +580,10 @@ struct HomeView: View {
                 // Prefetch tracklists for the top releases visible in the
                 // feed so the user's first tap is already a cache hit. Caps
                 // concurrency and skips anything already cached, so this is
-                // cheap on repeat launches.
+                // cheap on repeat launches. Bumped from 10 → 30 so most of
+                // the visible grid is warmed before the user starts scrolling.
                 let topProviderIDs = (derived.newReleases + derived.pastAndSeen)
-                    .prefix(10)
+                    .prefix(30)
                     .map(\.providerID)
                 Task.detached(priority: .utility) {
                     await TrackPrefetcher.prefetchBatch(providerIDs: topProviderIDs)
@@ -419,52 +598,16 @@ struct HomeView: View {
                     return
                 }
                 hasAutoRefreshed = true
-                startRefresh()
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 10) {
-                        Button {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                                isSearchPresented.toggle()
-                            }
-                            if !isSearchPresented {
-                                releaseSearchText = ""
-                                searchFieldFocused = false
-                            }
-                            // When opening, focus is set inside the field
-                            // itself via `.onAppear` — no timer-based delay.
-                        } label: {
-                            Image(systemName: "magnifyingglass")
-                                .font(.body.weight(.semibold))
-                                .foregroundStyle(isSearchPresented ? AppTheme.accent : AppTheme.primaryText)
-                        }
-                        .accessibilityLabel(isSearchPresented ? "Hide search" : "Search releases")
-
-                        ToolbarRefreshButton(
-                            isIdleDisabled: trackedArtists.isEmpty,
-                            onIdleTap: { startRefresh() },
-                            onActiveTap: { showingRefreshDetail = true }
-                        )
-
-                        Menu {
-                            Button {
-                                markAllAsSeen()
-                            } label: {
-                                Label("Mark all as read", systemImage: "checkmark.circle")
-                            }
-                            .disabled(derived.unreadCount == 0)
-                            Button {
-                                showingSettings = true
-                            } label: {
-                                Label("Settings", systemImage: "gearshape")
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis")
-                        }
-                        .accessibilityLabel("More")
-                    }
+                // Stale-aware: skip the network round-trip if we refreshed
+                // less than 30 minutes ago. Opening the app frequently
+                // (e.g. via notification) was hammering Apple Music with
+                // back-to-back refreshes that returned the same data.
+                let lastSuccess = UserDefaults.standard.double(forKey: AppSettings.lastSuccessfulRefreshAt)
+                if lastSuccess > 0 {
+                    let age = Date().timeIntervalSince1970 - lastSuccess
+                    if age < 30 * 60 { return }
                 }
+                startRefresh()
             }
             .confirmationDialog(
                 "Mark all \(derived.unreadCount) releases as read?",
@@ -488,6 +631,9 @@ struct HomeView: View {
                     .presentationDetents([.height(220)])
                     .presentationDragIndicator(.visible)
                     .presentationBackground(AppTheme.background)
+                    // Let the user scroll the feed behind the small refresh
+                    // card without dismissing it — feels much less modal.
+                    .presentationBackgroundInteraction(.enabled(upThrough: .height(220)))
             }
             .onChange(of: refreshCoordinator.isRefreshing) { _, newValue in
                 // Auto-dismiss the detail sheet when the refresh ends so the
@@ -499,62 +645,23 @@ struct HomeView: View {
         }
     }
 
-    /// Custom inline search field rendered just below the feed header. Replaces
-    /// SwiftUI's `.searchable` modifier because the latter installs a system
-    /// pull-to-reveal gesture at the top of the scroll view we can't opt out
-    /// of — the user wanted search to appear only via the toolbar magnifier.
-    private var inlineSearchField: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(AppTheme.secondary)
-            TextField("Search releases", text: $releaseSearchText)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .foregroundStyle(AppTheme.primaryText)
-                .focused($searchFieldFocused)
-                .submitLabel(.search)
-                .onAppear {
-                    // Field is now in the hierarchy → safe to pop the
-                    // keyboard immediately. Far faster than the previous
-                    // 150ms timer-based focus.
-                    searchFieldFocused = true
-                }
-            if !releaseSearchText.isEmpty {
-                Button {
-                    releaseSearchText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(AppTheme.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            Button("Cancel") {
-                releaseSearchText = ""
-                isSearchPresented = false
-                searchFieldFocused = false
-            }
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(AppTheme.accent)
-        }
-        .padding(.horizontal, 12)
-        .frame(height: 40)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(AppTheme.surface))
-        .padding(.horizontal, 18)
-    }
-
     private func header(derived: DerivedReleases) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Feed")
-                .font(.system(size: 36, weight: .bold, design: .rounded))
-                .foregroundStyle(AppTheme.primaryText)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-
             // Unread count is the only feed-relevant metric here — artist and
-            // upcoming totals belong to their own tabs.
+            // upcoming totals belong to their own tabs. The "Feed" title now
+            // lives in the native nav bar so it collapses to a small pill on
+            // scroll (matches the Videos tab).
             HStack(spacing: 10) {
                 inlineMetric(value: derived.unreadCount, label: "unread", color: AppTheme.yellow)
+                if !isRefreshing, let last = lastRefreshedLabel {
+                    Text("·")
+                        .font(.caption2)
+                        .foregroundStyle(AppTheme.secondary)
+                    Text(last)
+                        .font(.caption)
+                        .foregroundStyle(AppTheme.secondary)
+                        .accessibilityLabel("Last refreshed \(last)")
+                }
                 Spacer()
                 layoutToggleChip
                 typeFilterChip
@@ -566,6 +673,40 @@ struct HomeView: View {
             // (current artist, X/Y count, stop button).
         }
         .padding(.horizontal, 18)
+    }
+
+    /// Search / refresh / more buttons, rendered inline at the right of the
+    /// "Feed" title row (previously lived in the nav bar toolbar).
+    @ViewBuilder
+    private func headerActionButtons(derived: DerivedReleases) -> some View {
+        HStack(spacing: 10) {
+            ToolbarRefreshButton(
+                isIdleDisabled: trackedArtists.isEmpty,
+                onIdleTap: { startRefresh() },
+                onActiveTap: { showingRefreshDetail = true }
+            )
+
+            Menu {
+                Button {
+                    markAllAsSeen()
+                } label: {
+                    Label("Mark all as read", systemImage: "checkmark.circle")
+                }
+                .disabled(derived.unreadCount == 0)
+                Button {
+                    showingSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .frame(width: 30, height: 30)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("More")
+        }
     }
 
     /// Three-state layout toggle: hybrid → list → grid → hybrid.
@@ -629,12 +770,24 @@ struct HomeView: View {
                 Capsule().fill(releaseKindFilter == .all ? AppTheme.surface : AppTheme.elevatedSurface)
             )
         }
+        .accessibilityLabel("Filter releases by type")
+        .accessibilityValue(releaseKindFilter.rawValue)
     }
 
     private var dot: some View {
         Circle()
             .fill(AppTheme.secondary.opacity(0.6))
             .frame(width: 3, height: 3)
+    }
+
+    private var lastRefreshedLabel: String? {
+        guard lastSuccessfulRefreshAt > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: lastSuccessfulRefreshAt)
+        let elapsed = Date().timeIntervalSince(date)
+        if elapsed < 60 { return "just now" }
+        if elapsed < 3600 { return "\(Int(elapsed / 60)) min ago" }
+        if elapsed < 86_400 { return "\(Int(elapsed / 3600))h ago" }
+        return "\(Int(elapsed / 86_400))d ago"
     }
 
     private func inlineMetric(value: Int, label: String, color: Color) -> some View {
@@ -736,7 +889,11 @@ struct HomeView: View {
                         // bucket to a hero row so the most recent drop reads as
                         // more important than the rest of the unread list.
                         let useHero = feedLayoutRaw == "list" && title == "New"
-                        VStack(spacing: 8) {
+                        // LazyVStack — without this, switching to the Feed tab on
+                        // libraries with 100+ artists instantiated ~150 release
+                        // rows eagerly before the tab could appear, freezing the
+                        // current tab for ~2s. Rows now build as they scroll in.
+                        LazyVStack(spacing: 8) {
                             ForEach(Array(releases.enumerated()), id: \.element.id) { idx, release in
                                 NavigationLink(value: release) {
                                     if useHero && idx == 0 {
@@ -760,9 +917,43 @@ struct HomeView: View {
     @ViewBuilder
     private func pastReleasesByMonth(_ releases: [ReleaseData]) -> some View {
         if !releases.isEmpty {
-            VStack(alignment: .leading, spacing: 18) {
-                ForEach(monthBuckets(for: releases), id: \.label) { bucket in
+            let buckets = monthBuckets(for: releases)
+            let visibleBuckets = showAllPastMonths
+                ? buckets
+                : Array(buckets.prefix(defaultPastMonthCount))
+            let hiddenCount = buckets.count - visibleBuckets.count
+            let hiddenReleaseCount = visibleBuckets.count < buckets.count
+                ? buckets.dropFirst(visibleBuckets.count).reduce(0) { $0 + $1.releases.count }
+                : 0
+
+            // LazyVStack so off-screen month buckets aren't instantiated until
+            // the user scrolls. Each bucket holds its own ForEach of releases,
+            // so eagerly building all buckets multiplied the tab-switch cost.
+            LazyVStack(alignment: .leading, spacing: 18) {
+                ForEach(visibleBuckets, id: \.label) { bucket in
                     releaseGroup(bucket.label, releases: bucket.releases)
+                }
+
+                if hiddenCount > 0 {
+                    Button {
+                        showAllPastMonths = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "chevron.down")
+                                .font(.footnote.weight(.semibold))
+                            Text("Show \(hiddenReleaseCount) older release\(hiddenReleaseCount == 1 ? "" : "s")")
+                                .font(.subheadline.weight(.semibold))
+                        }
+                        .foregroundStyle(AppTheme.accent)
+                        .padding(.vertical, 12)
+                        .frame(maxWidth: .infinity)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(AppTheme.surface)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 18)
                 }
             }
         }
@@ -816,7 +1007,8 @@ struct HomeView: View {
     }
 
     private func heroGridCard(_ release: ReleaseData) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let providerID = release.providerID
+        return VStack(alignment: .leading, spacing: 8) {
             CachedAsyncImage(url: release.artworkURL) {
                 releaseArtworkPlaceholder(release)
             }
@@ -850,6 +1042,14 @@ struct HomeView: View {
             }
         }
         .contextMenu { releaseContextMenu(release) } preview: { releaseContextMenuPreview(release) }
+        .onAppear {
+            // Per-cell tracklist warmup. Skips if already cached; otherwise
+            // fetches in the background so a tap into the album page opens
+            // with the tracklist already populated.
+            Task.detached(priority: .utility) {
+                await TrackPrefetcher.prefetch(providerID: providerID)
+            }
+        }
     }
 
     private func releaseRow(_ release: ReleaseData) -> some View {
@@ -873,6 +1073,12 @@ struct HomeView: View {
                     if labelArtistIDs.contains(release.artistProviderID) {
                         LabelSourceBadge()
                     }
+                }
+                if let via = viaTrackedArtistName(for: release) {
+                    Text("via \(via)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(AppTheme.accent)
+                        .lineLimit(1)
                 }
                 HStack(spacing: 6) {
                     Text(release.formattedReleaseDate)
@@ -919,8 +1125,15 @@ struct HomeView: View {
                 Text(ReleaseTitleFormatter.displayTitle(release.title))
                     .font(.system(size: 20, weight: .bold, design: .rounded))
                     .foregroundStyle(AppTheme.primaryText)
-                    .lineLimit(2)
+                    .lineLimit(3)
                     .multilineTextAlignment(.leading)
+
+                if let via = viaTrackedArtistName(for: release) {
+                    Text("via \(via)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(AppTheme.accent)
+                        .lineLimit(1)
+                }
 
                 HStack(spacing: 6) {
                     Text(release.formattedReleaseDate)
@@ -953,26 +1166,33 @@ struct HomeView: View {
     /// stutter on weaker devices when the row is large. This preview is just the
     /// artwork + two lines of text — fast to render and feels punchier.
     private func releaseContextMenuPreview(_ release: ReleaseData) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            CachedAsyncImage(url: release.artworkURL) {
-                releaseArtworkPlaceholder(release)
-            }
-            .frame(width: 220, height: 220)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        // Wrapping the preview in a NavigationLink (with the matching
+        // `.navigationDestination(for: ReleaseData.self)` already installed
+        // on the parent) lets a tap on the lifted preview push the album
+        // detail view, which is what users instinctively try.
+        NavigationLink(value: release) {
+            VStack(alignment: .leading, spacing: 10) {
+                CachedAsyncImage(url: release.artworkURL) {
+                    releaseArtworkPlaceholder(release)
+                }
+                .frame(width: 220, height: 220)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(ReleaseTitleFormatter.displayTitle(release.title))
-                    .font(.headline)
-                    .foregroundStyle(AppTheme.primaryText)
-                    .lineLimit(2)
-                Text(release.artistName)
-                    .font(.subheadline)
-                    .foregroundStyle(AppTheme.secondary)
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(ReleaseTitleFormatter.displayTitle(release.title))
+                        .font(.headline)
+                        .foregroundStyle(AppTheme.primaryText)
+                        .lineLimit(2)
+                    Text(release.artistName)
+                        .font(.subheadline)
+                        .foregroundStyle(AppTheme.secondary)
+                        .lineLimit(1)
+                }
             }
+            .padding(14)
+            .background(AppTheme.surface)
         }
-        .padding(14)
-        .background(AppTheme.surface)
+        .buttonStyle(.plain)
     }
 
     /// Long-press menu shared by every release surface in the feed. Covers the
@@ -981,6 +1201,7 @@ struct HomeView: View {
     /// menu rather than duplicating button definitions.
     @ViewBuilder
     private func releaseContextMenu(_ release: ReleaseData) -> some View {
+        // Order: primary → share → state action → destructive (last).
         // "Add to Calendar" lives on the album detail page (only relevant for
         // upcoming releases). In the feed it just adds visual noise to every
         // long-press menu, so it's hidden here.
@@ -994,10 +1215,10 @@ struct HomeView: View {
                 Label("Share", systemImage: "square.and.arrow.up")
             }
         }
-        Divider()
         Button {
             release.isSeen.toggle()
-            try? modelContext.save()
+            // Debounced save — fast successive toggles collapse to one commit.
+            ModelContextSaveDebouncer.shared.scheduleSave(modelContext)
             // Toggle doesn't change `storedReleases.count`, so .task(id:)
             // won't refire. Refresh the cache inline so the row moves to
             // the correct bucket immediately.
@@ -1006,9 +1227,23 @@ struct HomeView: View {
             Label(release.isSeen ? "Mark unseen" : "Mark seen",
                   systemImage: release.isSeen ? "circle" : "checkmark.circle")
         }
+        Divider()
+        // Quick path to stop following the source artist directly from a
+        // release row — saves the user a trip to the Artists tab when
+        // something they no longer care about keeps surfacing in the feed.
+        if let trackedArtist = trackedArtists.first(where: { $0.providerID == release.artistProviderID }) {
+            Button(role: .destructive) {
+                trackedArtist.isTracked = false
+                ModelContextSaveDebouncer.shared.scheduleSave(modelContext)
+                refreshTrackedSets()
+                cachedDerived = computeDerived()
+            } label: {
+                Label("Unfollow \(trackedArtist.name)", systemImage: "person.fill.xmark")
+            }
+        }
         Button(role: .destructive) {
             release.dismissedAt = Date()
-            try? modelContext.save()
+            ModelContextSaveDebouncer.shared.scheduleSave(modelContext)
             cachedDerived = computeDerived()
         } label: {
             Label("Dismiss", systemImage: "xmark")
@@ -1044,6 +1279,9 @@ struct HomeView: View {
         }
         try? modelContext.save()
         cachedDerived = computeDerived()
+        // Success haptic so the action feels acknowledged — without this the
+        // 100-row mutation appears to do nothing on slower devices.
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
     private func startRefresh() {
@@ -1120,7 +1358,7 @@ fileprivate struct ToolbarRefreshButton: View {
                 } else {
                     Image(systemName: "arrow.clockwise")
                         .font(.body.weight(.semibold))
-                        .foregroundStyle(AppTheme.accent)
+                        .foregroundStyle(AppTheme.navAccent)
                 }
             }
             .frame(width: 30, height: 30)

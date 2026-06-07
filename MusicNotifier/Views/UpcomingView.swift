@@ -63,7 +63,10 @@ struct UpcomingView: View {
     @AppStorage(AppSettings.showLiveAlbums) private var showLiveAlbums = true
     @AppStorage(AppSettings.showCompilations) private var showCompilations = true
     @AppStorage(AppSettings.showRemixes) private var showRemixes = true
-    @State private var selectedDay: Date?
+    // Default to today so the first visit to the calendar layout already
+    // shows the user-relevant releases instead of an empty pane that only
+    // populates after they tap a date.
+    @State private var selectedDay: Date? = Calendar.current.startOfDay(for: Date())
 
     private var layout: UpcomingLayout {
         UpcomingLayout(rawValue: layoutRaw) ?? .list
@@ -76,6 +79,40 @@ struct UpcomingView: View {
     private struct UpcomingDerived {
         var upcoming: [ReleaseData] = []
         var calendar: [ReleaseData] = []
+    }
+
+    /// Cached derivation so `body` never runs the O(N) release walk inline.
+    /// Same pattern as `HomeView.cachedDerived`: during a refresh, SwiftData
+    /// `@Query` invalidations would otherwise force `makeUpcomingDerived()`
+    /// to re-walk every release synchronously on body, which is exactly the
+    /// "tab switch takes 2s during refresh" hitch users reported. The walk
+    /// now runs in `.task(id:)` after the first frame paints.
+    @State private var cachedUpcomingDerived = UpcomingDerived()
+
+    /// Identity key for `.task(id:)`. When any of these change, the cache
+    /// recomputes off the body's hot path.
+    private struct UpcomingDerivedKey: Hashable {
+        var releaseCount: Int
+        var trackedCount: Int
+        var showAlbums: Bool
+        var showSingles: Bool
+        var showEPs: Bool
+        var showLiveAlbums: Bool
+        var showCompilations: Bool
+        var showRemixes: Bool
+    }
+
+    private var upcomingDerivedKey: UpcomingDerivedKey {
+        UpcomingDerivedKey(
+            releaseCount: storedReleases.count,
+            trackedCount: trackedArtists.count,
+            showAlbums: showAlbums,
+            showSingles: showSingles,
+            showEPs: showEPs,
+            showLiveAlbums: showLiveAlbums,
+            showCompilations: showCompilations,
+            showRemixes: showRemixes
+        )
     }
 
     private func makeUpcomingDerived() -> UpcomingDerived {
@@ -109,7 +146,11 @@ struct UpcomingView: View {
     }
 
     var body: some View {
-        let derived = makeUpcomingDerived()
+        // Render from the cached projection; `.task(id:)` keeps it fresh.
+        // Walking storedReleases inline here was the source of the tab-switch
+        // hitch during refresh — SwiftData invalidations triggered a full
+        // re-walk on every `@Query` fire.
+        let derived = cachedUpcomingDerived
         return NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
@@ -123,14 +164,15 @@ struct UpcomingView: View {
                         case .grid: gridLayoutView(upcoming: derived.upcoming)
                         case .calendar: calendarLayoutView(calendar: derived.calendar)
                         }
+                        endOfListFooter(count: derived.upcoming.count)
                     }
 
                     Spacer(minLength: 24)
                 }
                 .padding(.top, 4)
             }
-            .overlay(alignment: .top) { topFadeOverlay }
             .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
             .appScreenBackground()
             .navigationDestination(for: ReleaseData.self) { release in
                 AlbumView(release: release)
@@ -142,23 +184,15 @@ struct UpcomingView: View {
                     await TrackPrefetcher.prefetchBatch(providerIDs: topIDs)
                 }
             }
+            // Deferred derivation. `.task(id:)` runs after the current frame
+            // paints, so the O(N) release walk never blocks the body render —
+            // critical during refresh, when SwiftData @Query invalidations
+            // would otherwise force a synchronous walk on every save.
+            .task(id: upcomingDerivedKey) {
+                let next = makeUpcomingDerived()
+                await MainActor.run { cachedUpcomingDerived = next }
+            }
         }
-    }
-
-    // MARK: - Top fade
-
-    /// Opaque-to-transparent gradient over the very top of the scroll view so
-    /// content scrolling under the system status bar doesn't overlap with the
-    /// big "Upcoming" header text or month titles.
-    private var topFadeOverlay: some View {
-        LinearGradient(
-            colors: [AppTheme.background, AppTheme.background.opacity(0)],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-        .frame(height: 60)
-        .ignoresSafeArea(edges: .top)
-        .allowsHitTesting(false)
     }
 
     // MARK: - Header
@@ -204,7 +238,7 @@ struct UpcomingView: View {
             case .calendar: .list
             }
             layoutRaw = next.rawValue
-            if next == .calendar { selectedDay = nil }
+            if next == .calendar { selectedDay = Calendar.current.startOfDay(for: Date()) }
         } label: {
             Image(systemName: layout.systemImage)
                 .font(.footnote.weight(.semibold))
@@ -219,11 +253,15 @@ struct UpcomingView: View {
     // MARK: - List layout
 
     private func listLayoutView(upcoming: [ReleaseData]) -> some View {
+        // LazyVStack outer + inner — without these, every upcoming row across
+        // every month bucket was instantiated up-front, freezing the tab
+        // switch for ~2s on libraries with many upcoming releases.
+        LazyVStack(alignment: .leading, spacing: 18) {
         ForEach(monthBuckets(from: upcoming), id: \.label) { bucket in
-            VStack(alignment: .leading, spacing: 10) {
+            LazyVStack(alignment: .leading, spacing: 10) {
                 SectionHeader(title: bucket.label)
                     .padding(.horizontal, 20)
-                VStack(spacing: 12) {
+                LazyVStack(spacing: 12) {
                     ForEach(bucket.releases) { release in
                         NavigationLink(value: release) {
                             UpcomingRow(release: release)
@@ -233,6 +271,7 @@ struct UpcomingView: View {
                 }
                 .padding(.horizontal, 20)
             }
+        }
         }
     }
 
@@ -416,6 +455,24 @@ struct UpcomingView: View {
         return cells
     }
 
+    // MARK: - End-of-list footer
+
+    private func endOfListFooter(count: Int) -> some View {
+        VStack(spacing: 6) {
+            Image(systemName: "checkmark.circle")
+                .font(.title3)
+                .foregroundStyle(AppTheme.secondary.opacity(0.7))
+            Text("That's all upcoming")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(AppTheme.secondary)
+            Text("\(count) release\(count == 1 ? "" : "s") on the horizon")
+                .font(.caption)
+                .foregroundStyle(AppTheme.secondary.opacity(0.7))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 18)
+    }
+
     // MARK: - Empty state
 
     private var emptyState: some View {
@@ -578,6 +635,9 @@ extension Calendar {
 private struct UpcomingRow: View {
     let release: ReleaseData
     @Environment(\.modelContext) private var modelContext
+    @Query(filter: #Predicate<ArtistData> { artist in
+        artist.isTracked
+    }, sort: \ArtistData.name) private var trackedArtists: [ArtistData]
 
     var body: some View {
         // Two-tier card. Top tier: date stamp, artwork, artist + title, then
@@ -596,8 +656,8 @@ private struct UpcomingRow: View {
                                 .foregroundStyle(AppTheme.secondary)
                         }
                 }
-                .frame(width: 56, height: 56)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .frame(width: 72, height: 72)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(release.artistName.uppercased())
@@ -654,11 +714,7 @@ private struct UpcomingRow: View {
                 .fill(AppTheme.surface)
         )
         .contextMenu {
-            Button {
-                Task { _ = try? await CalendarService().addRelease(release) }
-            } label: {
-                Label("Add to Calendar", systemImage: "calendar.badge.plus")
-            }
+            // Order: primary → share → state action → destructive (last).
             if let url = release.albumURL {
                 Button {
                     UIApplication.shared.open(url)
@@ -669,7 +725,23 @@ private struct UpcomingRow: View {
                     Label("Share", systemImage: "square.and.arrow.up")
                 }
             }
+            if release.isUpcoming {
+                Button {
+                    Task { _ = try? await CalendarService().addRelease(release) }
+                } label: {
+                    Label("Add to Calendar", systemImage: "calendar.badge.plus")
+                }
+            }
             Divider()
+            // Direct unfollow from the release row — saves a trip to Artists.
+            if let trackedArtist = trackedArtists.first(where: { $0.providerID == release.artistProviderID }) {
+                Button(role: .destructive) {
+                    trackedArtist.isTracked = false
+                    try? modelContext.save()
+                } label: {
+                    Label("Unfollow \(trackedArtist.name)", systemImage: "person.fill.xmark")
+                }
+            }
             Button(role: .destructive) {
                 release.dismissedAt = Date()
                 try? modelContext.save()
@@ -692,39 +764,8 @@ private struct UpcomingRow: View {
     }
 
     /// Mixed-case countdown string for the inline meta line. Same logic as
-    /// `InlineCountdown` but lower-cased to read as part of a sentence
-    /// ("Album · 3 days") instead of the standalone uppercase pill style.
-    /// "Imminent" = 0–7 days out (inclusive of today, exclusive of past).
-    /// Drives the red accent fill on the countdown pill so soon-to-drop
-    /// releases are scannable at a glance.
-    private func isImminent(date: Date) -> Bool {
-        let days = Calendar.current.dateComponents(
-            [.day],
-            from: Calendar.current.startOfDay(for: Date()),
-            to: Calendar.current.startOfDay(for: date)
-        ).day ?? 0
-        return days >= 0 && days <= 7
-    }
-
-    private func countdownText(for date: Date) -> String {
-        let days = Calendar.current.dateComponents(
-            [.day],
-            from: Calendar.current.startOfDay(for: Date()),
-            to: Calendar.current.startOfDay(for: date)
-        ).day ?? 0
-        if days < 0 {
-            let abs = -days
-            if abs == 1 { return "yesterday" }
-            if abs < 14 { return "\(abs) days ago" }
-            if abs < 60 { return "\(abs / 7) weeks ago" }
-            return "released"
-        }
-        if days == 0 { return "today" }
-        if days == 1 { return "tomorrow" }
-        if days < 14 { return "\(days) days" }
-        if days < 60 { return "\(days / 7) weeks" }
-        return "\(days / 30) months"
-    }
+    private func isImminent(date: Date) -> Bool { ReleaseCountdown.isImminent(date) }
+    private func countdownText(for date: Date) -> String { ReleaseCountdown.inlineLabel(for: date) }
 
     private var dateStamp: some View {
         let date = release.releaseDate
@@ -769,28 +810,32 @@ struct AddToCalendarButton: View {
     private enum ButtonState { case idle, loading, success, failed }
 
     var body: some View {
-        Button {
-            Task { await addToCalendar() }
-        } label: {
-            ZStack {
-                Circle()
-                    .fill(state == .success ? AppTheme.accent : AppTheme.elevatedSurface)
-                    .frame(width: 36, height: 36)
-                Group {
-                    switch state {
-                    case .idle: Image(systemName: "calendar.badge.plus")
-                    case .loading: ProgressView().controlSize(.small)
-                    case .success: Image(systemName: "checkmark")
-                    case .failed: Image(systemName: "exclamationmark")
+        // Past / today releases are already out — adding them to a calendar
+        // would just create a past event. Hide the affordance entirely.
+        if release.isUpcoming {
+            Button {
+                Task { await addToCalendar() }
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(state == .success ? AppTheme.accent : AppTheme.elevatedSurface)
+                        .frame(width: 36, height: 36)
+                    Group {
+                        switch state {
+                        case .idle: Image(systemName: "calendar.badge.plus")
+                        case .loading: ProgressView().controlSize(.small)
+                        case .success: Image(systemName: "checkmark")
+                        case .failed: Image(systemName: "exclamationmark")
+                        }
                     }
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(state == .success ? Color.white : AppTheme.secondary)
                 }
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(state == .success ? Color.white : AppTheme.secondary)
             }
+            .buttonStyle(.plain)
+            .disabled(state == .loading || state == .success)
+            .accessibilityLabel("Add to Calendar")
         }
-        .buttonStyle(.plain)
-        .disabled(state == .loading || state == .success)
-        .accessibilityLabel("Add to Calendar")
     }
 
     @MainActor
@@ -809,47 +854,64 @@ struct AddToCalendarButton: View {
     }
 }
 
+/// One source of truth for countdown text + imminent classification. Both
+/// `InlineCountdown` and `CountdownPill` (and the list-row metadata strip
+/// further up the file) consult this, so a release dated "tomorrow" reads
+/// the same word everywhere and the red ≤7d / grey >7d split is one rule
+/// instead of three near-identical implementations.
+enum ReleaseCountdown {
+    static func days(to date: Date) -> Int {
+        let cal = Calendar.current
+        return cal.dateComponents([.day], from: cal.startOfDay(for: Date()), to: cal.startOfDay(for: date)).day ?? 0
+    }
+
+    static func isImminent(_ date: Date) -> Bool {
+        let d = days(to: date)
+        return d >= 0 && d <= 7
+    }
+
+    /// Concise uppercase label for badges/pills.
+    static func label(for date: Date) -> String {
+        let d = days(to: date)
+        if d < 0 {
+            let abs = -d
+            if abs == 1 { return "YESTERDAY" }
+            if abs < 14 { return "\(abs) DAYS AGO" }
+            if abs < 60 { return "\(abs / 7) WEEKS AGO" }
+            return "RELEASED"
+        }
+        if d == 0 { return "TODAY" }
+        if d == 1 { return "TOMORROW" }
+        if d < 14 { return "\(d) DAYS" }
+        if d < 60 { return "\(d / 7) WEEKS" }
+        return date.formatted(.dateTime.month(.abbreviated).year())
+            .uppercased()
+    }
+
+    /// Lowercase form for inline metadata strips ("Album · tomorrow").
+    static func inlineLabel(for date: Date) -> String {
+        label(for: date).lowercased()
+    }
+}
+
 /// Compact inline countdown that sits alongside the release type tag.
 private struct InlineCountdown: View {
     let date: Date
 
     var body: some View {
-        let days = Calendar.current.dateComponents(
-            [.day],
-            from: Calendar.current.startOfDay(for: Date()),
-            to: Calendar.current.startOfDay(for: date)
-        ).day ?? 0
-        let released = days < 0
-        let imminent = !released && days <= 7
+        let imminent = ReleaseCountdown.isImminent(date)
+        let released = ReleaseCountdown.days(to: date) < 0
 
         HStack(spacing: 4) {
             Image(systemName: released ? "checkmark.circle.fill" : (imminent ? "flame.fill" : "clock"))
                 .font(.caption2.weight(.bold))
-            Text(label(for: days))
+            Text(ReleaseCountdown.label(for: date))
                 .font(.caption2.weight(.bold))
                 .tracking(0.3)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
         }
         .foregroundStyle(imminent ? AppTheme.accent : AppTheme.secondary)
-    }
-
-    /// Concise countdown labels. "IN " prefix dropped because it pushes the
-    /// label onto a second line in narrow grid cells; "3 DAYS" or "7 WEEKS"
-    /// reads the same and always fits on one line.
-    private func label(for days: Int) -> String {
-        if days < 0 {
-            let abs = -days
-            if abs == 1 { return "YESTERDAY" }
-            if abs < 14 { return "\(abs) DAYS AGO" }
-            if abs < 60 { return "\(abs / 7) WEEKS AGO" }
-            return "RELEASED"
-        }
-        if days == 0 { return "TODAY" }
-        if days == 1 { return "TOMORROW" }
-        if days < 14 { return "\(days) DAYS" }
-        if days < 60 { return "\(days / 7) WEEKS" }
-        return "\(days / 30) MONTHS"
     }
 }
 
@@ -859,30 +921,17 @@ private struct CountdownPill: View {
     let date: Date
 
     var body: some View {
-        let days = Calendar.current.dateComponents(
-            [.day],
-            from: Calendar.current.startOfDay(for: Date()),
-            to: Calendar.current.startOfDay(for: date)
-        ).day ?? 0
-        let isImminent = days >= 0 && days <= 7
+        let isImminent = ReleaseCountdown.isImminent(date)
         let bg = isImminent ? AppTheme.accent : AppTheme.elevatedSurface
         let fg: Color = isImminent ? .white : AppTheme.secondary
 
-        Text(label(for: days))
+        Text(ReleaseCountdown.label(for: date))
             .font(.caption2.weight(.bold))
             .tracking(0.3)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .foregroundStyle(fg)
             .background(Capsule().fill(bg))
-    }
-
-    private func label(for days: Int) -> String {
-        if days <= 0 { return "TODAY" }
-        if days == 1 { return "1 DAY" }
-        if days < 14 { return "\(days) DAYS" }
-        if days < 60 { return "\(days / 7)W" }
-        return "\(days / 30) MO"
     }
 }
 

@@ -9,7 +9,7 @@ import SwiftData
 
 enum ArtistImportMode: String, CaseIterable, Identifiable {
     case all = "All Artists"
-    case skipCollaborations = "No & Names"
+    case skipCollaborations = "Skip Collabs"
     case favoritesOnly = "Favorites Only"
 
     var id: String { rawValue }
@@ -48,25 +48,32 @@ struct AppleMusicLibraryImportService {
         }
         Log.v("[Favorites] after filter: \(filteredArtists.count) artists will be imported")
 
+        let existingArtists = try modelContext.fetch(FetchDescriptor<ArtistData>())
+        let index = ArtistDedupIndex(existing: existingArtists)
+
         for artist in filteredArtists {
             let providerID = artist.id.rawValue
-            let descriptor = FetchDescriptor<ArtistData>(
-                predicate: #Predicate { storedArtist in
-                    storedArtist.providerID == providerID
-                }
-            )
+            let artworkURL = artist.artwork?.url(width: 300, height: 300)
 
-            if let existingArtist = try modelContext.fetch(descriptor).first {
+            if let existingArtist = index.find(providerID: providerID, name: artist.name) {
                 existingArtist.name = artist.name
-                existingArtist.artworkURL = artist.artwork?.url(width: 300, height: 300)
+                existingArtist.artworkURL = artworkURL
+                // Importing an artist signals intent to follow them — flip
+                // tracked on so the user doesn't have to do a second pass of
+                // bell taps to actually get notifications.
+                existingArtist.isTracked = true
+                if existingArtist.catalogArtistID == nil {
+                    existingArtist.catalogArtistID = providerID
+                }
             } else {
-                modelContext.insert(
-                    ArtistData(
-                        providerID: providerID,
-                        name: artist.name,
-                        artworkURL: artist.artwork?.url(width: 300, height: 300)
-                    )
+                let row = ArtistData(
+                    providerID: providerID,
+                    name: artist.name,
+                    artworkURL: artworkURL,
+                    isTracked: true
                 )
+                modelContext.insert(row)
+                index.register(row)
             }
         }
 
@@ -215,16 +222,16 @@ struct AppleMusicLibraryImportService {
     @MainActor
     func importCatalogArtist(_ artist: Artist, into modelContext: ModelContext, tracked: Bool = true) throws {
         let providerID = artist.id.rawValue
-        let descriptor = FetchDescriptor<ArtistData>(
-            predicate: #Predicate { storedArtist in
-                storedArtist.providerID == providerID
-            }
-        )
+        let existingArtists = try modelContext.fetch(FetchDescriptor<ArtistData>())
+        let index = ArtistDedupIndex(existing: existingArtists)
 
-        if let existingArtist = try modelContext.fetch(descriptor).first {
+        if let existingArtist = index.find(providerID: providerID, name: artist.name) {
             existingArtist.name = artist.name
             existingArtist.artworkURL = artist.artwork?.url(width: 300, height: 300)
             existingArtist.isTracked = tracked || existingArtist.isTracked
+            if existingArtist.catalogArtistID == nil {
+                existingArtist.catalogArtistID = providerID
+            }
         } else {
             modelContext.insert(
                 ArtistData(
@@ -242,17 +249,17 @@ struct AppleMusicLibraryImportService {
     @MainActor
     func importCatalogArtist(_ artist: ProviderArtistSearchResult, into modelContext: ModelContext, tracked: Bool = true) throws {
         let providerID = artist.id
-        let descriptor = FetchDescriptor<ArtistData>(
-            predicate: #Predicate { storedArtist in
-                storedArtist.providerID == providerID
-            }
-        )
+        let existingArtists = try modelContext.fetch(FetchDescriptor<ArtistData>())
+        let index = ArtistDedupIndex(existing: existingArtists)
 
-        if let existingArtist = try modelContext.fetch(descriptor).first {
+        if let existingArtist = index.find(providerID: providerID, name: artist.name) {
             existingArtist.name = artist.name
             existingArtist.artworkURL = artist.artworkURL
             existingArtist.provider = MusicProvider.appleMusic.rawValue
             existingArtist.isTracked = tracked || existingArtist.isTracked
+            if existingArtist.catalogArtistID == nil {
+                existingArtist.catalogArtistID = providerID
+            }
         } else {
             modelContext.insert(
                 ArtistData(
@@ -479,6 +486,45 @@ private func runArtworkLookups(_ lookups: [ArtworkLookup]) async -> [ArtworkResu
             }
         }
         return collected
+    }
+}
+
+/// Looks up an existing `ArtistData` row by providerID, catalogArtistID, or
+/// normalized name. We need all three because the same artist can be imported
+/// via different paths (library API → library ID; favorites/catalog search →
+/// catalog ID), and the IDs don't overlap. Matching by normalized name catches
+/// the remaining cross-mode duplicates.
+@MainActor
+private final class ArtistDedupIndex {
+    private var byProviderID: [String: ArtistData] = [:]
+    private var byCatalogID: [String: ArtistData] = [:]
+    private var byNormalizedName: [String: ArtistData] = [:]
+
+    init(existing: [ArtistData]) {
+        for row in existing { register(row) }
+    }
+
+    func register(_ row: ArtistData) {
+        if !row.providerID.isEmpty { byProviderID[row.providerID] = row }
+        if let catalogID = row.catalogArtistID, !catalogID.isEmpty {
+            byCatalogID[catalogID] = row
+        }
+        let normalized = Self.normalize(row.name)
+        if !normalized.isEmpty { byNormalizedName[normalized] = row }
+    }
+
+    func find(providerID: String, name: String) -> ArtistData? {
+        if let hit = byProviderID[providerID] { return hit }
+        if let hit = byCatalogID[providerID] { return hit }
+        let normalized = Self.normalize(name)
+        if !normalized.isEmpty, let hit = byNormalizedName[normalized] { return hit }
+        return nil
+    }
+
+    private static func normalize(_ name: String) -> String {
+        name
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

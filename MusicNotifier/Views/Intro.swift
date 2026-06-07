@@ -22,17 +22,7 @@ struct Intro: View {
         NavigationStack {
             if isChoosingArtists {
                 OnboardingArtistImportView(
-                    onFinish: { hasCompletedOnboarding = true },
-                    onChangeProvider: {
-                        // Bounce back to the provider picker (e.g. Spotify Premium block).
-                        // Preselect Apple Music so the user can just tap Continue.
-                        selectedItem = MusicProvider.appleMusic.rawValue
-                        selectedMusicProvider = MusicProvider.appleMusic.rawValue
-                        UserDefaults(suiteName: AppSettings.appGroupIdentifier)?
-                            .set(MusicProvider.appleMusic.rawValue, forKey: AppSettings.selectedMusicProvider)
-                        authorizationMessage = "Spotify blocked the import — the signed-in account needs a Premium subscription. Continue with Apple Music or sign in with a Premium Spotify account."
-                        isChoosingArtists = false
-                    }
+                    onFinish: { hasCompletedOnboarding = true }
                 )
             } else {
                 VStack(spacing: 0) {
@@ -65,7 +55,6 @@ struct Intro: View {
                     VStack(spacing: 12) {
                         HStack(spacing: 12) {
                             providerButton(name: MusicProvider.appleMusic.rawValue, imageName: "AppleMusicIcon", isAvailable: true)
-                            providerButton(name: MusicProvider.spotify.rawValue, imageName: "SpotifyIcon", isAvailable: true)
                         }
 
                         if let authorizationMessage {
@@ -144,24 +133,6 @@ struct Intro: View {
     }
 
     private func authorize() async {
-        if MusicProvider.fromStoredName(selectedItem) == .spotify {
-            let service = SpotifyService()
-            do {
-                if !service.isConnected {
-                    try await service.authenticate()
-                }
-                selectedMusicProvider = selectedItem
-                UserDefaults(suiteName: AppSettings.appGroupIdentifier)?
-                    .set(selectedItem, forKey: AppSettings.selectedMusicProvider)
-                authorizationDenied = false
-                isChoosingArtists = true
-            } catch {
-                authorizationDenied = true
-                authorizationMessage = "Spotify sign-in failed: \(error.localizedDescription)"
-            }
-            return
-        }
-
         let auth = await MusicAuthorization.request()
         if auth == .authorized {
             selectedMusicProvider = selectedItem
@@ -197,7 +168,6 @@ private struct OnboardingArtistImportView: View {
     @State private var importMessage: String?
     @State private var notificationMessage: String?
     let onFinish: () -> Void
-    let onChangeProvider: () -> Void
 
     private var trackedArtists: [ArtistData] {
         artists.filter(\.isTracked)
@@ -214,7 +184,6 @@ private struct OnboardingArtistImportView: View {
                     if artists.isEmpty {
                         emptyState
                     } else {
-                        bulkActions
                         artistList
                     }
 
@@ -267,7 +236,7 @@ private struct OnboardingArtistImportView: View {
             Text("Pick the artists you follow")
                 .font(.system(size: 26, weight: .bold, design: .rounded))
                 .foregroundStyle(AppTheme.primaryText)
-            Text("Import from \(selectedMusicProvider), then tap the bell beside each artist you want release alerts for.")
+            Text("Import from Apple Music, then tap the bell beside each artist you want release alerts for.")
                 .font(.subheadline)
                 .foregroundStyle(AppTheme.secondary)
         }
@@ -277,41 +246,35 @@ private struct OnboardingArtistImportView: View {
 
     private var importCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            if MusicProvider.fromStoredName(selectedMusicProvider) == .appleMusic {
-                HStack(spacing: 12) {
-                    ForEach(ArtistImportMode.allCases) { mode in
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) { importMode = mode }
-                        } label: {
-                            Text(mode.rawValue)
-                                .font(.footnote.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 10)
-                                .background(
-                                    Capsule().fill(importMode == mode ? AppTheme.accent : AppTheme.elevatedSurface)
-                                )
-                                .foregroundStyle(importMode == mode ? .white : AppTheme.secondary)
-                        }
-                        .buttonStyle(.plain)
+            HStack(spacing: 12) {
+                ForEach(ArtistImportMode.allCases) { mode in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { importMode = mode }
+                    } label: {
+                        Text(mode.rawValue)
+                            .font(.footnote.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(
+                                Capsule().fill(importMode == mode ? AppTheme.accent : AppTheme.elevatedSurface)
+                            )
+                            .foregroundStyle(importMode == mode ? .white : AppTheme.secondary)
                     }
+                    .buttonStyle(.plain)
                 }
-
-                Text(importMode.description)
-                    .font(.footnote)
-                    .foregroundStyle(AppTheme.secondary)
-            } else {
-                Text(SpotifyService().isConnected ? "Imports the artists you follow on Spotify." : "Connect Spotify first to import followed artists.")
-                    .font(.footnote)
-                    .foregroundStyle(AppTheme.secondary)
             }
+
+            Text(importMode.description)
+                .font(.footnote)
+                .foregroundStyle(AppTheme.secondary)
 
             Button {
                 Task { await importArtists() }
             } label: {
-                Label(isImporting ? "Importing…" : "Import from \(selectedMusicProvider)", systemImage: "square.and.arrow.down")
+                Label(isImporting ? "Importing…" : "Import from Apple Music", systemImage: "square.and.arrow.down")
             }
             .buttonStyle(PrimaryButtonStyle())
-            .disabled(isImporting || (MusicProvider.fromStoredName(selectedMusicProvider) == .spotify && !SpotifyService().isConnected))
+            .disabled(isImporting)
         }
         .padding(16)
         .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(AppTheme.surface))
@@ -446,26 +409,9 @@ private struct OnboardingArtistImportView: View {
         importMessage = nil
 
         do {
-            let importedCount: Int
-            switch MusicProvider.fromStoredName(selectedMusicProvider) {
-            case .appleMusic:
-                importedCount = try await AppleMusicLibraryImportService().importArtists(mode: importMode, into: modelContext)
-            case .spotify:
-                importedCount = try await SpotifyService().importFollowedArtists(into: modelContext)
-            }
-            importMessage = "Imported \(importedCount) artists. Select the ones you want to track."
+            _ = try await AppleMusicLibraryImportService().importArtists(mode: importMode, into: modelContext)
+            importMessage = nil
         } catch {
-            // Spotify currently blocks non-Premium accounts at the API layer while the
-            // app sits in Development Mode. Detect that case and bounce back to the
-            // provider picker so the user can switch to Apple Music.
-            let description = String(reflecting: error).lowercased()
-            let spotifyPremiumBlocked = description.contains("premium subscription")
-                || description.contains("does not have a spotify premium")
-            if spotifyPremiumBlocked {
-                isImporting = false
-                onChangeProvider()
-                return
-            }
             importMessage = "Could not import artists: \(error.localizedDescription)"
         }
 
@@ -477,7 +423,6 @@ private struct OnboardingArtistImportView: View {
             artist.isTracked = isTracked
         }
         try? modelContext.save()
-        importMessage = isTracked ? "Tracking all imported artists." : "Stopped tracking all artists."
     }
 
     @MainActor

@@ -22,11 +22,13 @@ enum ReleaseClassifier {
             return .unknown
         }
 
-        if releaseDate > now {
+        let today = calendar.startOfDay(for: now)
+        let releaseDay = calendar.startOfDay(for: releaseDate)
+        if releaseDay > today {
             return .upcoming
         }
 
-        let daysSinceRelease = calendar.dateComponents([.day], from: releaseDate, to: now).day ?? 0
+        let daysSinceRelease = calendar.dateComponents([.day], from: releaseDay, to: today).day ?? 0
         return daysSinceRelease <= 14 ? .new : .past
     }
 }
@@ -49,12 +51,18 @@ enum ArtistImportFilter {
 extension ReleaseData {
     var isUpcoming: Bool {
         guard let releaseDate else { return false }
-        return releaseDate > Date()
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let releaseDay = cal.startOfDay(for: releaseDate)
+        return releaseDay > today
     }
 
     var daysAgo: Int {
         guard let releaseDate else { return 0 }
-        return Calendar.current.dateComponents([.day], from: releaseDate, to: Date()).day ?? 0
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let releaseDay = cal.startOfDay(for: releaseDate)
+        return cal.dateComponents([.day], from: releaseDay, to: today).day ?? 0
     }
 
     var isNewRelease: Bool {

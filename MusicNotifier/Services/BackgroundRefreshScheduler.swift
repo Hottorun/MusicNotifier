@@ -25,9 +25,12 @@ enum BackgroundRefreshScheduler {
         return
         #else
         let request = BGAppRefreshTaskRequest(identifier: taskIdentifier)
-        // iOS treats this as an earliest-time floor, not a target. 4 hours gives the
-        // system room to schedule opportunistically while still keeping releases fresh.
-        request.earliestBeginDate = Date().addingTimeInterval(4 * 60 * 60)
+        // iOS treats this as an earliest-time floor, not a target. 2 hours
+        // gives the system roughly 2–3 firing opportunities through a normal
+        // day (morning, midday, evening) instead of the previous 1–2 with a
+        // 4-hour floor — matches the user's "another refresh somewhere in
+        // the afternoon" ask without needing a second task identifier.
+        request.earliestBeginDate = Date().addingTimeInterval(2 * 60 * 60)
 
         do {
             try BGTaskScheduler.shared.submit(request)

@@ -52,9 +52,15 @@ enum AppTheme {
         }
     }
     static var accentSoft: Color { accent.opacity(0.16) }
+    // Neutral nav accent — used for toolbar icons, Done buttons, refresh chevrons.
+    // Keeping nav off the brand red preserves red for *meaning* (destructive,
+    // imminent badges, unread dots) instead of decoration.
+    static let navAccent = primaryText
+    // Brightened secondary so caption metadata clears WCAG AA against the
+    // dark surface — previous 0.62 grey failed contrast for small text.
     static let secondary = adaptive(
-        dark: UIColor(red: 0.62, green: 0.62, blue: 0.66, alpha: 1),
-        light: UIColor(red: 0.42, green: 0.42, blue: 0.46, alpha: 1)
+        dark: UIColor(white: 0.75, alpha: 1),
+        light: UIColor(red: 0.36, green: 0.36, blue: 0.40, alpha: 1)
     )
 
     static var coral: Color { accent }

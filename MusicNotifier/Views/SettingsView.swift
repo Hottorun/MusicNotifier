@@ -77,6 +77,10 @@ struct SettingsView: View {
     @State private var statusMessage: String?
     @State private var showingDangerZone = false
     @State private var showingDeveloperInfo = false
+    @State private var diagnosticReport: String?
+    @State private var isDiagnosing = false
+    @State private var showingDiagnosticPicker = false
+    @State private var diagnosticPickerSearch: String = ""
 
     private var trackedArtists: [ArtistData] {
         artists.filter(\.isTracked)
@@ -84,7 +88,10 @@ struct SettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 24) {
+            // LazyVStack so sections below the fold (Calendar / Videos /
+            // Concerts / Gestures / Support / Danger) don't get instantiated
+            // until scrolled into view. First-open paints noticeably faster.
+            LazyVStack(spacing: 24) {
                 statsCard
 
                 iCloudStatusSection
@@ -198,6 +205,68 @@ struct SettingsView: View {
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
         .appScreenBackground()
+        // Re-apply at the SettingsView level so the picker's effect is
+        // visible immediately, even if the enclosing sheet hadn't picked up
+        // the parent's preferredColorScheme yet.
+        .preferredColorScheme(resolvedColorScheme)
+        .sheet(isPresented: $showingDiagnosticPicker) {
+            NavigationStack {
+                List {
+                    ForEach(filteredDiagnosticArtists, id: \.providerID) { artist in
+                        Button {
+                            showingDiagnosticPicker = false
+                            runArtistDiagnostic(artist: artist)
+                        } label: {
+                            HStack {
+                                Text(artist.name)
+                                    .foregroundStyle(AppTheme.primaryText)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(AppTheme.secondary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .listStyle(.plain)
+                .searchable(text: $diagnosticPickerSearch, placement: .navigationBarDrawer(displayMode: .always), prompt: "Find artist")
+                .navigationTitle("Pick artist")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Cancel") { showingDiagnosticPicker = false }
+                    }
+                }
+            }
+            .preferredColorScheme(resolvedColorScheme)
+        }
+        .sheet(item: Binding(
+            get: { diagnosticReport.map(DiagnosticReportPayload.init) },
+            set: { if $0 == nil { diagnosticReport = nil } }
+        )) { payload in
+            NavigationStack {
+                ScrollView {
+                    Text(payload.body)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                }
+                .navigationTitle("Fetch diagnostic")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Done") { diagnosticReport = nil }
+                    }
+                    ToolbarItem(placement: .topBarLeading) {
+                        ShareLink(item: payload.body) { Image(systemName: "square.and.arrow.up") }
+                    }
+                }
+            }
+            .preferredColorScheme(resolvedColorScheme)
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Done") {
@@ -205,6 +274,43 @@ struct SettingsView: View {
                 }
                 .foregroundStyle(AppTheme.accent)
             }
+        }
+    }
+
+    /// Identifiable wrapper so the report can drive a `.sheet(item:)`.
+    private struct DiagnosticReportPayload: Identifiable {
+        let body: String
+        var id: String { body }
+    }
+
+    private var filteredDiagnosticArtists: [ArtistData] {
+        let needle = diagnosticPickerSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        if needle.isEmpty { return trackedArtists }
+        return trackedArtists.filter { $0.name.localizedCaseInsensitiveContains(needle) }
+    }
+
+    private func runArtistDiagnostic(artist: ArtistData) {
+        isDiagnosing = true
+        let input = ArtistFetchInput(
+            providerID: artist.providerID,
+            name: artist.name,
+            provider: artist.provider,
+            catalogArtistID: artist.catalogArtistID
+        )
+        Task {
+            let report = await AppleMusicReleaseService().diagnoseArtistFetch(for: input)
+            await MainActor.run {
+                diagnosticReport = report
+                isDiagnosing = false
+            }
+        }
+    }
+
+    private var resolvedColorScheme: ColorScheme? {
+        switch appearanceRaw {
+        case "light": return .light
+        case "dark": return .dark
+        default: return nil
         }
     }
 
@@ -370,9 +476,12 @@ struct SettingsView: View {
                 Circle()
                     .fill(swatchColor.opacity(showReleaseTypeBadges ? 0.22 : 0.08))
                     .frame(width: 28, height: 28)
-                Circle()
-                    .fill(swatchColor)
-                    .frame(width: 14, height: 14)
+                // Shape-codes the kind on top of the swatch so colorblind
+                // users still see *which* kind they're configuring. Falls
+                // back to a filled dot for the unknown/single case.
+                Image(systemName: kindGlyph(kind))
+                    .font(.system(size: 12, weight: .heavy))
+                    .foregroundStyle(swatchColor)
                 if hex != nil && showReleaseTypeBadges {
                     ColorPicker("", selection: Binding<Color>(
                         get: { Color(hex: hex!.wrappedValue) },
@@ -590,6 +699,17 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(AppTheme.secondary)
                 .padding(.horizontal, 24)
+        }
+    }
+
+    private func kindGlyph(_ kind: ReleaseKind) -> String {
+        switch kind {
+        case .album: return "opticaldisc"
+        case .single: return "music.note"
+        case .ep: return "square.stack"
+        case .liveAlbum: return "mic"
+        case .compilation: return "rectangle.stack"
+        case .remix: return "waveform"
         }
     }
 
@@ -969,6 +1089,18 @@ struct SettingsView: View {
                         BackgroundRefreshScheduler.scheduleDailyRefresh()
                         statusMessage = "Background refresh scheduled."
                     }
+                    settingsDivider
+                    // Opens a searchable picker — a 60-item Menu was unusable
+                    // when the user's library was large. Tap → sheet with a
+                    // search field → tap an artist → runs the three fetch
+                    // paths and shows the report.
+                    devActionRow(isDiagnosing ? "Diagnosing…" : "Diagnose artist fetch",
+                                 systemImage: "stethoscope") {
+                        guard !trackedArtists.isEmpty, !isDiagnosing else { return }
+                        diagnosticPickerSearch = ""
+                        showingDiagnosticPicker = true
+                    }
+                    settingsDivider
                     devActionRow("Debug: log diagnostics", systemImage: "ladybug") {
                         let groupID = AppSettings.appGroupIdentifier
                         let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID)

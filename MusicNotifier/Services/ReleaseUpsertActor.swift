@@ -41,23 +41,59 @@ actor ReleaseUpsertActor {
         let globalPreference: ArtistNotificationPreference
     }
 
+    /// Sendable artist-update bundle so the actor can apply tracked-artist
+    /// metadata (resolved catalog ID, artwork URL, lastCheckedAt) inside the
+    /// same transaction as the release upsert — eliminating the duplicate
+    /// `@Query` invalidation that used to fire from a separate MainActor save.
+    struct ArtistUpdates: Sendable {
+        let resolvedCatalogIDs: [String: String]
+        let resolvedArtworkURLs: [String: URL]
+        let trackedProviderIDs: [String]
+    }
+
     func apply(
         fetchedReleases: [FetchedRelease],
         now: Date,
         sameDaySummaryEnabled: Bool,
         upcomingEnabled: Bool,
-        context: PerArtistContext
+        // First-ever refresh after install or after iCloud import. New rows
+        // with a past `releaseDate` are inserted as already-seen so the feed
+        // doesn't open with a wall of historical drops the user has likely
+        // heard. Future-dated rows stay unseen so the user still gets the
+        // "new" treatment on releases that drop after install.
+        markHistoricalAsSeen: Bool = false,
+        context: PerArtistContext,
+        artistUpdates: ArtistUpdates? = nil
     ) -> Output {
         var output = Output()
         var newReleasesData: [ReleaseData] = []
         var dateChangedData: [ReleaseData] = []
 
         do {
-            // Same single-fetch + dictionary lookup the original main-thread
-            // version used. Crucially, this fetch now runs on the actor's
-            // executor so the SQLite read isn't blocking the UI.
-            let allExisting = try modelContext.fetch(FetchDescriptor<ReleaseData>())
-            var existingByID = Dictionary(uniqueKeysWithValues: allExisting.map { ($0.providerID, $0) })
+            // Bounded fetch: only pull ReleaseData rows whose `providerID`
+            // appears in the current fetched batch. The dedup key is
+            // `providerID`, so any row not in this set can't collide with
+            // an insert. On long-lived libraries (10k+ stored releases)
+            // this drops the SQLite read + dict build from O(all rows)
+            // to O(batch size) — the largest single source of end-of-
+            // refresh lag.
+            let fetchedIDs = Set(fetchedReleases.map(\.providerID))
+            let existingDescriptor = FetchDescriptor<ReleaseData>(
+                predicate: #Predicate { fetchedIDs.contains($0.providerID) }
+            )
+            let allExisting = try modelContext.fetch(existingDescriptor)
+            // CloudKit mirroring can briefly land two `ReleaseData` rows for
+            // the same providerID before `CloudSyncDeduplicator` merges them.
+            // `uniqueKeysWithValues` crashes on collision; `uniquingKeysWith`
+            // keeps the more-recently-updated row, which the upsert then
+            // patches in place. The duplicate is left alone — the deduper
+            // will remove it on its next pass.
+            var existingByID = Dictionary(
+                allExisting.map { ($0.providerID, $0) },
+                uniquingKeysWith: { lhs, rhs in
+                    lhs.lastUpdatedAt >= rhs.lastUpdatedAt ? lhs : rhs
+                }
+            )
 
             for fetched in fetchedReleases {
                 if let existing = existingByID[fetched.providerID] {
@@ -116,6 +152,24 @@ actor ReleaseUpsertActor {
                         provider: fetched.provider,
                         type: fetched.type
                     )
+                    // First-refresh seeding: pre-mark *deep-history* drops as
+                    // already seen so the feed doesn't open with years of
+                    // backfill noise. Anything from the last 60 days is kept
+                    // unseen — that window covers "this single dropped last
+                    // week" / "this album came out last month" which the user
+                    // legitimately wants to see as new on first launch.
+                    let historicalCutoffDays = 60
+                    let cutoff = Calendar.current.date(
+                        byAdding: .day,
+                        value: -historicalCutoffDays,
+                        to: Calendar.current.startOfDay(for: now)
+                    )
+                    if markHistoricalAsSeen,
+                       let rd = fetched.releaseDate,
+                       let cutoff,
+                       Calendar.current.startOfDay(for: rd) < cutoff {
+                        new.isSeen = true
+                    }
                     newReleasesData.append(new)
                     modelContext.insert(new)
                     existingByID[fetched.providerID] = new
@@ -168,14 +222,43 @@ actor ReleaseUpsertActor {
                     )
                 }
 
+            // Fold tracked-artist metadata writes into this same transaction
+            // so the @Query observers only see one propagation, not two.
+            if let artistUpdates {
+                let trackedIDs = Set(artistUpdates.trackedProviderIDs)
+                let descriptor = FetchDescriptor<ArtistData>(
+                    predicate: #Predicate { trackedIDs.contains($0.providerID) }
+                )
+                if let artists = try? modelContext.fetch(descriptor) {
+                    for artist in artists {
+                        if let catalogID = artistUpdates.resolvedCatalogIDs[artist.providerID] {
+                            artist.catalogArtistID = catalogID
+                        }
+                        if let artwork = artistUpdates.resolvedArtworkURLs[artist.providerID] {
+                            artist.artworkURL = artwork
+                        }
+                        artist.lastCheckedAt = now
+                    }
+                }
+            }
+
             try modelContext.save()
 
-            // Widget snapshot piggybacks on the dictionary we already have —
-            // no extra fetch needed. `captureSnapshot` only reads basic
-            // property values so it's safe to call on the actor's executor.
-            let (snapshot, requests) = WidgetSnapshotWriter.captureSnapshot(
-                from: Array(existingByID.values)
+            // Widget snapshot: the bounded `existingByID` fetch above only
+            // contains releases in this batch — not enough for the widget's
+            // "40 closest-to-now" view, especially on small incremental
+            // refreshes. Do a targeted fetch for widget content (released
+            // last 60 days OR upcoming) and feed that to the snapshot
+            // builder. Cheap because it's still date-bounded.
+            let widgetCutoff = Calendar.current.date(byAdding: .day, value: -60, to: now) ?? now
+            let widgetDescriptor = FetchDescriptor<ReleaseData>(
+                predicate: #Predicate { release in
+                    release.dismissedAt == nil &&
+                    (release.releaseDate == nil || release.releaseDate! >= widgetCutoff)
+                }
             )
+            let widgetReleases = (try? modelContext.fetch(widgetDescriptor)) ?? Array(existingByID.values)
+            let (snapshot, requests) = WidgetSnapshotWriter.captureSnapshot(from: widgetReleases)
             output.widgetSnapshot = snapshot
             output.widgetRequests = requests
         } catch {

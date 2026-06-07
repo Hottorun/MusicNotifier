@@ -61,16 +61,22 @@ struct ArtistDetailView: View {
             VStack(spacing: 22) {
                 hero
                 quickActions
+                // Releases come *before* bio/similar so the timeline (the
+                // primary reason to land on this page) doesn't sit below a
+                // wall of text-heavy artist context.
                 if releases.isEmpty {
                     timelineEmptyState
                 } else {
                     timeline
                 }
+                supplementalContext
             }
             .padding(.top, 8)
             .padding(.bottom, 32)
         }
-        .navigationTitle(artist.name)
+        // Empty nav title — the hero card displays the artist name in full.
+        // The back chevron alone is enough chrome at the top.
+        .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .appScreenBackground()
         .navigationDestination(for: ReleaseData.self) { release in
@@ -89,74 +95,108 @@ struct ArtistDetailView: View {
 
     // MARK: - Hero
 
+    /// Wide poster-style hero: the artist's artwork fills the full card,
+    /// a dark gradient brings text contrast at the bottom, and the name +
+    /// stats sit on top of the artwork itself. Replaces the previous
+    /// detached "circle on empty bg" composition, which read as a placeholder
+    /// rather than a hero. Nav title is hidden in `body` so the large name
+    /// here is the only one.
     private var hero: some View {
-        VStack(spacing: 12) {
+        ZStack(alignment: .bottomLeading) {
             CachedAsyncImage(url: artist.artworkURL) {
-                Circle().fill(AppTheme.elevatedSurface)
+                Rectangle().fill(AppTheme.elevatedSurface)
                     .overlay {
                         Image(systemName: "person.fill")
-                            .font(.system(size: 36, weight: .light))
+                            .font(.system(size: 48, weight: .light))
                             .foregroundStyle(AppTheme.secondary)
                     }
             }
-            .frame(width: 112, height: 112)
-            .clipShape(Circle())
-            .overlay(Circle().stroke(AppTheme.hairline, lineWidth: 1))
-            .shadow(color: .black.opacity(0.4), radius: 18, y: 8)
+            .aspectRatio(contentMode: .fill)
+            .frame(height: 280)
+            .frame(maxWidth: .infinity)
+            .clipped()
 
-            Text(artist.name)
-                .font(.system(size: 24, weight: .bold, design: .rounded))
-                .foregroundStyle(AppTheme.primaryText)
-                .multilineTextAlignment(.center)
-                .lineLimit(2)
+            // Heavy bottom gradient — keeps the text legible regardless of
+            // how light the artwork is. Top ~40% stays nearly transparent so
+            // the artwork still reads.
+            LinearGradient(
+                colors: [
+                    .black.opacity(0),
+                    .black.opacity(0.35),
+                    .black.opacity(0.85)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
 
-            // Single inline metrics line replaces the old boxed stat card.
-            HStack(spacing: 6) {
-                heroMetric("\(releases.count)", "releases")
-                heroDot
-                if lastFMConfigured, let info = lastFMInfo {
-                    heroMetric(compact(info.listeners), "listeners")
+            VStack(alignment: .leading, spacing: 8) {
+                Text(artist.name)
+                    .font(.system(size: 30, weight: .heavy, design: .rounded))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .shadow(color: .black.opacity(0.5), radius: 8, y: 2)
+
+                HStack(spacing: 6) {
+                    heroMetric("\(releases.count)", "releases")
                     heroDot
-                    heroMetric(compact(info.playcount), "plays")
-                } else if let lastCheckedAt = artist.lastCheckedAt {
-                    heroMetric(shortDate(lastCheckedAt), "checked")
-                } else {
-                    heroMetric(artist.addedAt.formatted(date: .abbreviated, time: .omitted), "since")
+                    if lastFMConfigured, let info = lastFMInfo {
+                        heroMetric(compact(info.listeners), "listeners")
+                        heroDot
+                        heroMetric(compact(info.playcount), "plays")
+                    } else if let lastCheckedAt = artist.lastCheckedAt {
+                        heroMetric(shortDate(lastCheckedAt), "checked")
+                    } else {
+                        heroMetric(artist.addedAt.formatted(date: .abbreviated, time: .omitted), "since")
+                    }
                 }
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.85))
             }
-            .font(.footnote)
-            .foregroundStyle(AppTheme.secondary)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 18)
         }
-        .padding(.horizontal, 20)
+        .frame(height: 280)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(AppTheme.hairline, lineWidth: 1)
+        )
+        .padding(.horizontal, 16)
     }
 
     private func heroMetric(_ value: String, _ label: String) -> some View {
         HStack(spacing: 4) {
-            Text(value).foregroundStyle(AppTheme.primaryText).fontWeight(.semibold)
-            Text(label)
+            Text(value).foregroundStyle(.white).fontWeight(.bold)
+            Text(label).foregroundStyle(.white.opacity(0.75))
         }
     }
 
     private var heroDot: some View {
-        Circle().fill(AppTheme.secondary.opacity(0.6)).frame(width: 3, height: 3)
+        Circle().fill(.white.opacity(0.5)).frame(width: 3, height: 3)
     }
 
     // MARK: - Quick actions
 
     private var quickActions: some View {
-        VStack(spacing: 14) {
-            HStack(spacing: 10) {
-                followTile
-                if let catalogID = artist.catalogArtistID,
-                   let url = URL(string: "https://music.apple.com/artist/\(catalogID)") {
-                    appleMusicIconButton(url: url)
-                }
+        HStack(spacing: 10) {
+            followTile
+            if let catalogID = artist.catalogArtistID,
+               let url = URL(string: "https://music.apple.com/artist/\(catalogID)") {
+                appleMusicIconButton(url: url)
             }
+        }
+        .padding(.horizontal, 20)
+    }
 
+    /// Bio + similar artists. Renders below the timeline so the page leads
+    /// with releases — supplementary context lives at the end.
+    @ViewBuilder
+    private var supplementalContext: some View {
+        VStack(spacing: 14) {
             if lastFMConfigured, let bio = lastFMInfo?.bio, !bio.isEmpty {
                 bioPreview(bio)
             }
-
             if let lastFMInfo, !lastFMInfo.similarArtists.isEmpty {
                 similarArtistsRow(lastFMInfo.similarArtists)
             }
@@ -432,7 +472,7 @@ struct ArtistDetailView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { showingBio = false }
-                        .foregroundStyle(AppTheme.accent)
+                        .foregroundStyle(AppTheme.navAccent)
                 }
             }
         }

@@ -13,13 +13,26 @@ struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
     @AppStorage(AppSettings.swipeBetweenTabs) private var swipeBetweenTabs = true
+    @AppStorage(AppSettings.appearance) private var appearanceRaw: String = "system"
     @AppStorage(AppSettings.enableVideosTab) private var enableVideosTab = false
     @AppStorage(AppSettings.enableConcertsTab) private var enableConcertsTab = false
     @AppStorage(AppSettings.releaseNotificationHour) private var releaseNotificationHour = 8
     @AppStorage(AppSettings.releaseNotificationMinute) private var releaseNotificationMinute = 0
-    @Query(sort: \ReleaseData.firstSeenAt, order: .reverse) private var releases: [ReleaseData]
+    // NOTE: deliberately no top-level `@Query releases` here.
+    // Every SwiftData save during a refresh (release upsert, videos, concerts)
+    // re-fires top-level @Query observers and re-runs ContentView's body — which
+    // re-renders the whole TabView and was making tab switches block for ~2s
+    // during a refresh. Releases are now fetched on demand by the deep-link
+    // handler, and the iPad sidebar's reactive counts live in `SidebarContent`
+    // so the query never instantiates on iPhone.
     @Query private var artists: [ArtistData]
     @State private var startFreshOverridden = false
+    // Latch: once we've shown Intro, never re-route to ICloudWelcomeView
+    // mid-flow. Without this, late-arriving CloudKit hydration during an
+    // Apple Music import yanks the user from the import sheet into the
+    // iCloud welcome — and tapping Continue there re-imports the same
+    // artists, creating duplicates.
+    @State private var hasShownIntro = false
     @State private var showingSettings = false
     @StateObject private var deepLinkRouter = DeepLinkRouter()
     @EnvironmentObject private var navigationDepth: TabNavigationDepth
@@ -45,12 +58,25 @@ struct ContentView: View {
                 .offset(x: -10_000, y: -10_000)
 
             if !hasCompletedOnboarding {
-                if !startFreshOverridden && !artists.isEmpty {
+                if !startFreshOverridden && !artists.isEmpty && !hasShownIntro {
                     // Fresh install + CloudKit hydrated an existing watchlist:
                     // skip the provider/import flow and offer a quick welcome.
                     ICloudWelcomeView(
                         artistCount: artists.count,
                         trackedCount: artists.filter(\.isTracked).count,
+                        onContinue: {
+                            // If iCloud mirrored artists with isTracked=false
+                            // (e.g. they were imported but never tracked on
+                            // the source device, or the field didn't round-
+                            // trip), the Feed would be empty and the refresh
+                            // button stays disabled. Auto-track everything so
+                            // "use my iCloud artists" actually does something.
+                            if !artists.contains(where: \.isTracked) {
+                                for artist in artists { artist.isTracked = true }
+                                try? modelContext.save()
+                            }
+                            hasCompletedOnboarding = true
+                        },
                         onStartFresh: {
                             for artist in artists { modelContext.delete(artist) }
                             try? modelContext.save()
@@ -59,6 +85,7 @@ struct ContentView: View {
                     )
                 } else {
                     Intro()
+                        .onAppear { hasShownIntro = true }
                 }
             } else if horizontalSizeClass == .regular {
                 // iPad / Mac Catalyst / landscape iPhone Pro Max: sidebar layout.
@@ -68,15 +95,23 @@ struct ContentView: View {
                 tabLayout
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(resolvedColorScheme)
+        // iOS 26's floating tab/nav pills leave the safe-area strips above
+        // and below the content uncovered. Without a root background those
+        // strips fall through to the system window black, which doesn't
+        // match AppTheme.background and reads as a black band at the top
+        // (under the status bar) and bottom (around the tab bar pill).
+        // Painting the background here covers the whole window including
+        // those safe-area regions.
+        .background(AppTheme.background.ignoresSafeArea())
         .onOpenURL { url in
-            deepLinkRouter.handle(url: url, releases: releases)
+            deepLinkRouter.handle(url: url, releases: fetchAllReleases())
         }
         // Notification tap → broadcasted by ForegroundNotificationDelegate.
         // Route the same way as system deep links so AlbumView pops up.
         .onReceive(NotificationCenter.default.publisher(for: .musicNotifierDeepLinkTapped)) { notification in
             if let url = notification.object as? URL {
-                deepLinkRouter.handle(url: url, releases: releases)
+                deepLinkRouter.handle(url: url, releases: fetchAllReleases())
             }
         }
         // Menu-bar / keyboard shortcut hooks (Mac + iPad). These fire from the
@@ -95,12 +130,17 @@ struct ContentView: View {
             NavigationStack {
                 AlbumView(release: release)
             }
+            .preferredColorScheme(resolvedColorScheme)
         }
         .sheet(isPresented: $showingSettings) {
             NavigationStack {
                 SettingsView()
             }
             .environment(refreshCoordinator)
+            // Sheets present in a separate window root, so the .preferred-
+            // ColorScheme applied to ContentView doesn't reach them. Re-apply
+            // here so Settings flips with the appearance picker too.
+            .preferredColorScheme(resolvedColorScheme)
         }
     }
 
@@ -155,8 +195,12 @@ struct ContentView: View {
     private var sidebar: some View {
         List(selection: sidebarSelectionBinding) {
             Section {
-                sidebarRow(SidebarDestination.feed, badge: unreadCount)
-                sidebarRow(SidebarDestination.upcoming, badge: upcomingCount)
+                SidebarBadgedRow(destination: .feed, kind: .unreadReleases) { destination, badge in
+                    sidebarRow(destination, badge: badge)
+                }
+                SidebarBadgedRow(destination: .upcoming, kind: .upcomingReleases) { destination, badge in
+                    sidebarRow(destination, badge: badge)
+                }
                 sidebarRow(SidebarDestination.artists, badge: trackedArtistCount)
             } header: {
                 Text("Library")
@@ -248,7 +292,7 @@ struct ContentView: View {
                         Text("\(trackedArtistCount) tracked")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(AppTheme.primaryText)
-                        Text(releases.count == 0 ? "No releases yet" : "\(releases.count) releases")
+                        SidebarReleaseCountText()
                             .font(.caption2)
                             .foregroundStyle(AppTheme.secondary)
                             .monospacedDigit()
@@ -318,13 +362,25 @@ struct ContentView: View {
         artists.lazy.filter(\.isTracked).count
     }
 
-    private var unreadCount: Int {
-        releases.lazy.filter { !$0.isSeen }.count
+    /// Resolves the user's appearance setting to a SwiftUI `ColorScheme?`.
+    /// `nil` means "follow the system", which is what we want for the
+    /// default — the previous hardcoded `.dark` ignored the setting entirely
+    /// and left sheets like Settings stranded in dark mode even when the
+    /// user picked light.
+    private var resolvedColorScheme: ColorScheme? {
+        switch appearanceRaw {
+        case "light": return .light
+        case "dark": return .dark
+        default: return nil
+        }
     }
 
-    private var upcomingCount: Int {
-        let today = Calendar.current.startOfDay(for: Date())
-        return releases.lazy.filter { ($0.releaseDate ?? .distantPast) >= today }.count
+    /// On-demand fetch for the deep-link handler. Avoids a top-level `@Query` that
+    /// would re-fire ContentView body on every refresh save and lag tab switches.
+    private func fetchAllReleases() -> [ReleaseData] {
+        (try? modelContext.fetch(
+            FetchDescriptor<ReleaseData>(sortBy: [SortDescriptor(\.firstSeenAt, order: .reverse)])
+        )) ?? []
     }
 
     private func startRefresh() {
@@ -389,6 +445,61 @@ struct ContentView: View {
                     deepLinkRouter.selectedTab = target
                 }
             }
+    }
+}
+
+/// Reactive badge for the iPad sidebar. Holds its own `@Query` so a SwiftData
+/// release save invalidates *this* row, not the entire ContentView/TabView tree.
+private struct SidebarBadgedRow<RowContent: View>: View {
+    let destination: SidebarDestination
+    let kind: Kind
+    @ViewBuilder let row: (SidebarDestination, Int) -> RowContent
+
+    enum Kind { case unreadReleases, upcomingReleases }
+
+    @Query private var releases: [ReleaseData]
+
+    init(
+        destination: SidebarDestination,
+        kind: Kind,
+        @ViewBuilder row: @escaping (SidebarDestination, Int) -> RowContent
+    ) {
+        self.destination = destination
+        self.kind = kind
+        self.row = row
+        switch kind {
+        case .unreadReleases:
+            _releases = Query(filter: #Predicate<ReleaseData> { !$0.isSeen })
+        case .upcomingReleases:
+            // SwiftData #Predicate can't take a captured Date, so we filter the
+            // common case (must have a date) in the predicate and the
+            // today-cutoff in-memory. The fetched set is still small enough
+            // that this isn't a hot path.
+            _releases = Query(filter: #Predicate<ReleaseData> { $0.releaseDate != nil })
+        }
+    }
+
+    var body: some View {
+        row(destination, badgeCount)
+    }
+
+    private var badgeCount: Int {
+        switch kind {
+        case .unreadReleases:
+            return releases.count
+        case .upcomingReleases:
+            let today = Calendar.current.startOfDay(for: Date())
+            return releases.lazy.filter { ($0.releaseDate ?? .distantPast) >= today }.count
+        }
+    }
+}
+
+/// Total-release count text for the iPad sidebar footer. Same isolation idea
+/// as `SidebarBadgedRow` — keep the `@Query` out of `ContentView`'s root.
+private struct SidebarReleaseCountText: View {
+    @Query private var releases: [ReleaseData]
+    var body: some View {
+        Text(releases.count == 0 ? "No releases yet" : "\(releases.count) releases")
     }
 }
 

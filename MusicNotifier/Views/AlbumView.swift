@@ -182,8 +182,10 @@ struct AlbumView: View {
         .navigationDestination(item: $artistPushTarget) { ArtistDetailView(artist: $0) }
         .toolbar {
             if releaseProvider == .appleMusic, let providerID = release?.providerID {
-                // Standalone calendar button — only for upcoming releases.
-                if let release, release.releaseDate.map({ $0 >= Calendar.current.startOfDay(for: Date()) }) == true {
+                // Standalone calendar button — only for strictly future releases.
+                // Today's releases are out already; the button would just create
+                // a calendar event in the past.
+                if let release, release.isUpcoming {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button {
                             Task { await addReleaseToCalendar(release) }
@@ -343,11 +345,13 @@ struct AlbumView: View {
                         Image(systemName: releaseProvider == .spotify ? "arrow.up.right.square" : "music.note")
                         Text("Open in \(releaseProvider.rawValue)")
                             .lineLimit(1)
+                            .minimumScaleFactor(0.8)
                     }
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(AppTheme.primaryText)
                     .frame(maxWidth: .infinity)
                     .frame(height: 46)
+                    .padding(.horizontal, 14)
                     .background(Capsule().fill(AppTheme.surface))
                 }
             }
@@ -602,7 +606,22 @@ struct AlbumView: View {
     @MainActor
     private func loadTracks() async {
         // Tracks are only fetchable via MusicKit (Apple Music). Spotify releases skip this.
-        defer { tracksLoadAttempted = true }
+        // Hold the "attempted" flip for ≥300ms so a fast empty-result path
+        // doesn't briefly flash the empty-tracklist state before showing
+        // either real tracks or the placeholder. Matches the perceived
+        // snappiness of system music apps.
+        let skeletonStart = Date()
+        defer {
+            let elapsed = Date().timeIntervalSince(skeletonStart)
+            if elapsed < 0.3 {
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64((0.3 - elapsed) * 1_000_000_000))
+                    tracksLoadAttempted = true
+                }
+            } else {
+                tracksLoadAttempted = true
+            }
+        }
         guard releaseProvider == .appleMusic, let providerID = release?.providerID else { return }
 
         // Hot path: tracks were seeded in init from the cache, so just queue

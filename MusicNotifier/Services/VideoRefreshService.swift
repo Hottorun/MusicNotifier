@@ -13,14 +13,11 @@ struct VideoRefreshSummary {
 
 @MainActor
 struct VideoRefreshService {
-    func refresh(
-        trackedArtists: [ArtistData],
-        modelContext: ModelContext
-    ) async -> VideoRefreshSummary {
-        // Labels (kind == "label") aren't fetchable via the artist endpoint —
-        // MusicKit returns 404 for label IDs hit as artists. Strip them up
-        // front so the videos pass only runs on real artist entries.
-        let inputs = trackedArtists
+    /// Inputs that should be fed to `AppleMusicVideoService.fetchVideos`.
+    /// Exposed so callers (e.g. the foreground coordinator) can kick the
+    /// network work off in parallel with the release fetch.
+    nonisolated static func fetchInputs(from trackedArtists: [ArtistData]) -> [ArtistFetchInput] {
+        trackedArtists
             .filter { $0.kind != "label" }
             .map {
                 ArtistFetchInput(
@@ -31,8 +28,20 @@ struct VideoRefreshService {
                     kind: $0.kind
                 )
             }
+    }
 
-        let fetched = await AppleMusicVideoService().fetchVideos(for: inputs)
+    func refresh(
+        trackedArtists: [ArtistData],
+        modelContext: ModelContext,
+        prefetched: [FetchedVideo]? = nil
+    ) async -> VideoRefreshSummary {
+        let fetched: [FetchedVideo]
+        if let prefetched {
+            fetched = prefetched
+        } else {
+            let inputs = Self.fetchInputs(from: trackedArtists)
+            fetched = await AppleMusicVideoService().fetchVideos(for: inputs)
+        }
         guard !fetched.isEmpty else { return VideoRefreshSummary(newVideoCount: 0) }
 
         let defaults = UserDefaults.standard

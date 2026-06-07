@@ -92,8 +92,6 @@ struct Artists: View {
     /// `.searchable` modifier was replaced because its built-in
     /// pull-to-reveal at the top of a scroll surface can't be opted out of,
     /// and that was making the search bar pop in unintentionally.
-    @State private var artistSearchFieldShown = false
-    @FocusState private var artistListSearchFocused: Bool
     @State private var selectedGenre: String? = nil
     @State private var scrubLetter: String? = nil
     @State private var lastScrubIndex: Int? = nil
@@ -191,9 +189,49 @@ struct Artists: View {
     /// (`visibleArtists`, `sectionLetters`, `letterIndex`) used to each walk the
     /// full artist list independently; this batches them into a single pass.
     private struct ArtistsSnapshot {
-        let visible: [ArtistData]
-        let sectionLetters: [String]
-        let letterIndex: [String: String]
+        var visible: [ArtistData] = []
+        var sectionLetters: [String] = []
+        var letterIndex: [String: String] = [:]
+        var summaries: [String: ArtistReleaseSummary] = [:]
+    }
+
+    /// Cached snapshot — same pattern as `HomeView.cachedDerived` and
+    /// `UpcomingView.cachedUpcomingDerived`. Walking `allReleases` × `artists`
+    /// synchronously in `body` was the source of the tab-switch hitch during
+    /// refresh, because SwiftData `@Query` invalidations forced a full re-walk
+    /// on every save. The walk now runs in `.task(id:)` after the frame paints.
+    @State private var cachedSnapshot = ArtistsSnapshot()
+
+    private struct ArtistsSnapshotKey: Hashable {
+        var artistCount: Int
+        var releaseCount: Int
+        var search: String
+        var listFilter: String
+        var sortOption: String
+        var selectedGenre: String?
+        var showAlbums: Bool
+        var showSingles: Bool
+        var showEPs: Bool
+        var showLiveAlbums: Bool
+        var showCompilations: Bool
+        var showRemixes: Bool
+    }
+
+    private var artistsSnapshotKey: ArtistsSnapshotKey {
+        ArtistsSnapshotKey(
+            artistCount: artists.count,
+            releaseCount: allReleases.count,
+            search: searchText,
+            listFilter: listFilter.rawValue,
+            sortOption: sortOption.rawValue,
+            selectedGenre: selectedGenre,
+            showAlbums: showAlbums,
+            showSingles: showSingles,
+            showEPs: showEPs,
+            showLiveAlbums: showLiveAlbums,
+            showCompilations: showCompilations,
+            showRemixes: showRemixes
+        )
     }
 
     private func makeSnapshot() -> ArtistsSnapshot {
@@ -209,7 +247,12 @@ struct Artists: View {
             }
             if index[key] == nil { index[key] = artist.providerID }
         }
-        return ArtistsSnapshot(visible: visible, sectionLetters: letters, letterIndex: index)
+        return ArtistsSnapshot(
+            visible: visible,
+            sectionLetters: letters,
+            letterIndex: index,
+            summaries: artistSummaries
+        )
     }
 
     private func letterKey(for name: String) -> String {
@@ -220,7 +263,9 @@ struct Artists: View {
     }
 
     var body: some View {
-        let snapshot = makeSnapshot()
+        // Read the cached snapshot instead of walking artists × releases inline.
+        // `.task(id:)` keeps it fresh after frames paint.
+        let snapshot = cachedSnapshot
         return NavigationStack {
             ScrollViewReader { scrollProxy in
                 ZStack(alignment: .trailing) {
@@ -237,6 +282,12 @@ struct Artists: View {
             // pushes. Inside NavigationStack so it lives in the same nav tree.
             .navigationDestination(item: $gridSelectedArtist) { artist in
                 ArtistDetailView(artist: artist)
+            }
+            // Deferred derivation. Walking the full release table + artist list
+            // synchronously in body was blocking tab switches during refresh.
+            .task(id: artistsSnapshotKey) {
+                let next = makeSnapshot()
+                await MainActor.run { cachedSnapshot = next }
             }
         }
     }
@@ -315,10 +366,6 @@ struct Artists: View {
             return List {
                 Group {
                     header
-                    if artistSearchFieldShown {
-                        inlineArtistSearchField
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                    }
                     filterRow
                     genreBulkActionBar
 
@@ -357,7 +404,7 @@ struct Artists: View {
                                 .listRowBackground(Color.clear)
                                 .listRowSeparator(.hidden)
                                 .listRowInsets(EdgeInsets(top: 3, leading: 18, bottom: 3, trailing: 18))
-                                .contextMenu { artistContextMenu(artist) } preview: { artistContextMenuPreview(artist) }
+                                .contextMenu { artistContextMenu(artist) }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                                     Button(role: .destructive) {
                                         deleteArtist(artist)
@@ -384,52 +431,15 @@ struct Artists: View {
                 }
             }
             .listStyle(.plain)
-            .navigationTitle("")
-            .navigationBarTitleDisplayMode(.inline)
-            .appScreenBackground()
-            // `.searchable` was removed — see `inlineArtistSearchField` below.
-            // SwiftUI's searchable installs a pull-to-reveal gesture on the
-            // surrounding scroll surface that can't be disabled; users were
-            // tripping it by overscrolling at the top of the list.
+            .navigationTitle("Artists")
+            .navigationBarTitleDisplayMode(.large)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 12) {
-                        Button {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                                artistSearchFieldShown.toggle()
-                            }
-                            if !artistSearchFieldShown {
-                                searchText = ""
-                                artistListSearchFocused = false
-                            }
-                            // Focus is requested by the field's own `.onAppear`.
-                        } label: {
-                            Image(systemName: "magnifyingglass")
-                                .font(.headline.weight(.semibold))
-                                .foregroundStyle(artistSearchFieldShown ? AppTheme.accent : AppTheme.primaryText)
-                        }
-                        .accessibilityLabel(artistSearchFieldShown ? "Hide search" : "Search artists")
-
-                        Menu {
-                            Button {
-                                showingImportSheet = true
-                            } label: {
-                                Label("Import from \(selectedMusicProvider)", systemImage: "square.and.arrow.down")
-                            }
-                            Button {
-                                showingSearchSheet = true
-                            } label: {
-                                Label("Add artist or label", systemImage: "magnifyingglass")
-                            }
-                        } label: {
-                            Image(systemName: "plus")
-                                .font(.headline.weight(.semibold))
-                                .foregroundStyle(AppTheme.primaryText)
-                        }
-                        .accessibilityLabel("Add artists")
-                    }
+                    headerActionButtons
                 }
             }
+            .appScreenBackground()
+            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search artists")
             .onAppear { refreshAvailableGenres() }
             .onChange(of: artists.count) { _, _ in refreshAvailableGenres() }
             .task {
@@ -450,62 +460,88 @@ struct Artists: View {
     }
 
     private var header: some View {
-        HStack(alignment: .lastTextBaseline, spacing: 12) {
-            Text("Artists")
-                .font(.system(size: 36, weight: .bold, design: .rounded))
-                .foregroundStyle(AppTheme.primaryText)
-
-            Spacer()
-
-            Text("\(trackedCount) of \(artists.count)")
+        // Title moved into the native nav bar so it collapses to a small pill
+        // on scroll (matches Videos). This row just holds the tracked-count
+        // filter chip.
+        HStack(alignment: .center, spacing: 12) {
+            // Plain text with simultaneousGesture — inside a List row,
+            // Button/onTapGesture get swallowed by the row's hit region,
+            // but a simultaneousGesture fires alongside the row's gesture.
+            // Always tappable, even when everything is already tracked —
+            // gives the user an "empty untracked" view they can verify
+            // against instead of a silently disabled chip.
+            Text("\(trackedCount) of \(artists.count) tracked")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(AppTheme.secondary)
+                .foregroundStyle(listFilter == .untracked ? AppTheme.accent : AppTheme.secondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
-                .background(Capsule().fill(AppTheme.surface))
+                .background(Capsule().fill(listFilter == .untracked ? AppTheme.accentSoft : AppTheme.surface))
+                .contentShape(Capsule())
+                .simultaneousGesture(TapGesture().onEnded {
+                    listFilter = (listFilter == .untracked) ? .all : .untracked
+                })
+                .accessibilityAddTraits(.isButton)
+                .accessibilityLabel(listFilter == .untracked
+                                    ? "Showing untracked. Tap to show all artists."
+                                    : "\(trackedCount) of \(artists.count) tracked. Tap to filter to untracked.")
+
+            Spacer(minLength: 8)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 18)
     }
 
-    /// Inline search bar rendered as a List row when the user taps the
-    /// toolbar magnifier. Replaces `.searchable` here for the same reason as
-    /// HomeView — to remove SwiftUI's pull-down-at-top auto-reveal.
-    private var inlineArtistSearchField: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(AppTheme.secondary)
-            TextField("Search artists", text: $searchText)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .foregroundStyle(AppTheme.primaryText)
-                .focused($artistListSearchFocused)
-                .submitLabel(.search)
-                .onAppear { artistListSearchFocused = true }
-            if !searchText.isEmpty {
+    /// Search / add buttons, rendered inline at the right of the "Artists"
+    /// title row (previously lived in the nav bar toolbar).
+    @ViewBuilder
+    private var headerActionButtons: some View {
+        HStack(spacing: 10) {
+            Menu {
                 Button {
-                    searchText = ""
+                    showingImportSheet = true
                 } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(AppTheme.secondary)
+                    Label("Import from Apple Music", systemImage: "square.and.arrow.down")
                 }
-                .buttonStyle(.plain)
-            }
-            Button("Cancel") {
-                searchText = ""
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                    artistSearchFieldShown = false
+                Button {
+                    showingSearchSheet = true
+                } label: {
+                    Label("Add artist or label", systemImage: "magnifyingglass")
                 }
-                artistListSearchFocused = false
+            } label: {
+                Image(systemName: "plus")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .frame(width: 30, height: 30)
+                    .contentShape(Rectangle())
             }
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(AppTheme.accent)
+            .accessibilityLabel("Add artists")
+
+            // Bulk tracking lives in its own visible menu — previously buried
+            // under the import sheet, which made "follow all my artists" a
+            // multi-step discovery problem.
+            Menu {
+                Button {
+                    setArtists(artists, tracked: true)
+                } label: {
+                    Label("Track all artists", systemImage: "bell.badge")
+                }
+                .disabled(artists.isEmpty || trackedCount == artists.count)
+
+                Button {
+                    setArtists(artists, tracked: false)
+                } label: {
+                    Label("Untrack all artists", systemImage: "bell.slash")
+                }
+                .disabled(trackedCount == 0)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .frame(width: 30, height: 30)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("More actions")
         }
-        .padding(.horizontal, 12)
-        .frame(height: 40)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(AppTheme.surface))
-        .padding(.horizontal, 18)
     }
 
     private var artistSearchField: some View {
@@ -641,64 +677,26 @@ struct Artists: View {
             GridItem(.flexible(), spacing: 10),
             GridItem(.flexible(), spacing: 10)
         ]
-        // Compute summaries once for the whole grid render, not per-tile.
-        let summaries = artistSummaries
+        // Read summaries from the cached snapshot. Computing `artistSummaries`
+        // inline here re-walks every release on every body render — the
+        // synchronous-walk-during-refresh path that was lagging tab switches.
+        let summaries = cachedSnapshot.summaries
         return LazyVGrid(columns: columns, spacing: 14) {
             ForEach(visibleArtists, id: \.providerID) { artist in
-                // Each cell lives in its own struct so SwiftUI gives it a
-                // stable identity. Inlining the tile + Button + contextMenu
-                // in a ForEach inside LazyVGrid leaks identity across cells —
-                // long-press always lifts the first artist, and tap-target
-                // hit testing gets confused. Extracting to ArtistGridCell
-                // fixes both at once.
                 ArtistGridCell(
+                    artist: artist,
                     onSelect: { gridSelectedArtist = artist },
-                    tile: { artistGridTile(artist, summary: summaries[artist.providerID]) },
-                    menu: { artistContextMenu(artist) },
-                    preview: { artistContextMenuPreview(artist) }
+                    tile: { artistGridTile(artist, summary: summaries[artist.providerID]) }
                 )
+                .id(artist.providerID)
             }
         }
     }
 
-    /// Lightweight long-press snapshot — artwork + name, nothing else. The
-    /// default snapshot would lift the entire list row including ring overlays
-    /// and metadata badges, which sometimes stutters on first present.
-    private func artistContextMenuPreview(_ artist: ArtistData) -> some View {
-        VStack(spacing: 14) {
-            CachedAsyncImage(url: artist.artworkURL) {
-                Circle().fill(AppTheme.elevatedSurface)
-                    .overlay {
-                        Image(systemName: "person.fill")
-                            .font(.system(size: 36, weight: .light))
-                            .foregroundStyle(AppTheme.secondary)
-                    }
-            }
-            .frame(width: 180, height: 180)
-            .clipShape(Circle())
-
-            Text(artist.name)
-                .font(.headline)
-                .foregroundStyle(AppTheme.primaryText)
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
-        }
-        .padding(20)
-        .background(AppTheme.surface)
-    }
-
-    /// Long-press menu for artist tiles and rows. Mirrors the MusicHarbor
-    /// pattern: notify toggle, open in Apple Music, share, remove. Most
-    /// actions are also reachable elsewhere — context menu is the quick path.
+    /// Long-press menu for artist tiles and rows.
+    /// Order: primary → share → state action → destructive (last).
     @ViewBuilder
     private func artistContextMenu(_ artist: ArtistData) -> some View {
-        Button {
-            artist.isTracked.toggle()
-            try? modelContext.save()
-        } label: {
-            Label(artist.isTracked ? "Stop notifications" : "Notify for new releases",
-                  systemImage: artist.isTracked ? "bell.slash" : "bell")
-        }
         if let catalogID = artist.catalogArtistID,
            let url = URL(string: "https://music.apple.com/artist/\(catalogID)") {
             Button {
@@ -709,6 +707,13 @@ struct Artists: View {
             ShareLink(item: url) {
                 Label("Share", systemImage: "square.and.arrow.up")
             }
+        }
+        Button {
+            artist.isTracked.toggle()
+            try? modelContext.save()
+        } label: {
+            Label(artist.isTracked ? "Stop notifications" : "Notify for new releases",
+                  systemImage: artist.isTracked ? "bell.slash" : "bell")
         }
         Divider()
         Button(role: .destructive) {
@@ -1034,45 +1039,6 @@ struct Artists: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     VStack(alignment: .leading, spacing: 10) {
-                        SectionHeader(title: "Service")
-                        Picker("Service", selection: $selectedMusicProvider) {
-                            Text(MusicProvider.appleMusic.rawValue).tag(MusicProvider.appleMusic.rawValue)
-                            Text(MusicProvider.spotify.rawValue).tag(MusicProvider.spotify.rawValue)
-                        }
-                        .pickerStyle(.segmented)
-                        .onChange(of: selectedMusicProvider) { _, newValue in
-                            UserDefaults(suiteName: AppSettings.appGroupIdentifier)?
-                                .set(newValue, forKey: AppSettings.selectedMusicProvider)
-                        }
-
-                        if MusicProvider.fromStoredName(selectedMusicProvider) == .spotify {
-                            Text(SpotifyService().isConnected ? "Imports followed Spotify artists." : "Connect Spotify to import followed artists.")
-                                .font(.footnote)
-                                .foregroundStyle(AppTheme.secondary)
-
-                            if !SpotifyService().isConnected {
-                                Button {
-                                    Task { await connectSpotify() }
-                                } label: {
-                                    Label("Connect Spotify", systemImage: "link")
-                                }
-                                .buttonStyle(PrimaryButtonStyle())
-                                .disabled(isImporting)
-                            }
-
-                            Button {
-                                Task {
-                                    await importSpotifyArtists()
-                                    if importMessage?.hasPrefix("Imported") == true {
-                                        showingImportSheet = false
-                                    }
-                                }
-                            } label: {
-                                Label(isImporting ? "Importing…" : "Import followed Spotify artists", systemImage: "square.and.arrow.down")
-                            }
-                            .buttonStyle(PrimaryButtonStyle())
-                            .disabled(isImporting || !SpotifyService().isConnected)
-                        } else {
                         SectionHeader(title: "Import mode")
                         Picker("Import Mode", selection: $importMode) {
                             ForEach(ArtistImportMode.allCases) { mode in
@@ -1084,40 +1050,17 @@ struct Artists: View {
                             .font(.footnote)
                             .foregroundStyle(AppTheme.secondary)
 
-                            Button {
-                                Task {
-                                    await importAppleMusicArtists()
-                                    if importMessage?.hasPrefix("Imported") == true {
-                                        showingImportSheet = false
-                                    }
+                        Button {
+                            Task {
+                                if await importAppleMusicArtists() {
+                                    showingImportSheet = false
                                 }
-                            } label: {
-                                Label(isImporting ? "Importing…" : "Import from Apple Music", systemImage: "square.and.arrow.down")
                             }
-                            .buttonStyle(PrimaryButtonStyle())
-                            .disabled(isImporting)
-                        }
-                    }
-
-                    Divider().background(AppTheme.hairline)
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        SectionHeader(title: "Bulk actions")
-                        Button {
-                            setArtists(artists, tracked: true)
                         } label: {
-                            Label("Track all artists", systemImage: "bell.badge")
+                            Label(isImporting ? "Importing…" : "Import from Apple Music", systemImage: "square.and.arrow.down")
                         }
-                        .buttonStyle(GhostButtonStyle())
-                        .disabled(artists.isEmpty)
-
-                        Button {
-                            setArtists(artists, tracked: false)
-                        } label: {
-                            Label("Untrack all artists", systemImage: "bell.slash")
-                        }
-                        .buttonStyle(GhostButtonStyle())
-                        .disabled(trackedCount == 0)
+                        .buttonStyle(PrimaryButtonStyle())
+                        .disabled(isImporting)
                     }
 
                     if let importMessage {
@@ -1437,18 +1380,19 @@ struct Artists: View {
     }
 
     @MainActor
-    private func importAppleMusicArtists() async {
+    @discardableResult
+    private func importAppleMusicArtists() async -> Bool {
         isImporting = true
         importMessage = nil
-
+        var success = false
         do {
-            let importedCount = try await AppleMusicLibraryImportService().importArtists(mode: importMode, into: modelContext)
-            importMessage = "Imported \(importedCount) artists. Tap the bell for artists you want to track."
+            _ = try await AppleMusicLibraryImportService().importArtists(mode: importMode, into: modelContext)
+            success = true
         } catch {
             importMessage = "Could not import artists: \(error.localizedDescription)"
         }
-
         isImporting = false
+        return success
     }
 
     @MainActor
@@ -1457,8 +1401,8 @@ struct Artists: View {
         importMessage = nil
 
         do {
-            let importedCount = try await SpotifyService().importFollowedArtists(into: modelContext)
-            importMessage = "Imported \(importedCount) artists. Tap the bell for artists you want to track."
+            _ = try await SpotifyService().importFollowedArtists(into: modelContext)
+            importMessage = nil
         } catch {
             importMessage = "Could not import Spotify artists: \(error.localizedDescription)"
         }
@@ -1489,7 +1433,6 @@ struct Artists: View {
             artist.isTracked = isTracked
         }
         try? modelContext.save()
-        importMessage = isTracked ? "Tracking \(artistsToUpdate.count) artists." : "Stopped tracking \(artistsToUpdate.count) artists."
     }
 
     
@@ -1699,17 +1642,17 @@ struct Artists: View {
 /// `ForEach` + `Button` + `.contextMenu` would route taps and long-press
 /// previews to the first iteration's data regardless of which tile was
 /// actually pressed.
-fileprivate struct ArtistGridCell<Tile: View, Menu: View, Preview: View>: View {
+fileprivate struct ArtistGridCell<Tile: View>: View {
+    let artist: ArtistData
     let onSelect: () -> Void
     @ViewBuilder var tile: () -> Tile
-    @ViewBuilder var menu: () -> Menu
-    @ViewBuilder var preview: () -> Preview
 
     var body: some View {
-        Button(action: onSelect) {
-            tile()
-        }
-        .buttonStyle(.plain)
-        .contextMenu(menuItems: menu, preview: preview)
+        // No contextMenu in grid mode — the menu's default snapshot lifts the
+        // entire grid as a tiny preview, which is jarring. Long-press actions
+        // are still available in the list view.
+        tile()
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onSelect)
     }
 }

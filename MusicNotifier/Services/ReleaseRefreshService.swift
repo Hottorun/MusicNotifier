@@ -138,19 +138,16 @@ struct ReleaseRefreshService {
             defaults.set(storefront, forKey: AppSettings.lastStorefrontCountryCode)
         }
 
-        // Update artist metadata on the main context. These are observed by
-        // @Query in Artists view; keeping them on main means @Query updates
-        // immediately without waiting for cross-context propagation.
-        for artist in trackedArtists {
-            if let catalogID = result.resolvedCatalogIDs[artist.providerID] {
-                artist.catalogArtistID = catalogID
-            }
-            if let artwork = result.resolvedArtworkURLs[artist.providerID] {
-                artist.artworkURL = artwork
-            }
-            artist.lastCheckedAt = now
-        }
-        try? modelContext.save()
+        // Artist metadata used to be written + saved on the main context
+        // here, separately from the actor's release save — producing two
+        // distinct @Query invalidations per refresh. We now bundle the
+        // updates into the actor's transaction so the UI sees a single
+        // commit at end-of-refresh.
+        let artistUpdates = ReleaseUpsertActor.ArtistUpdates(
+            resolvedCatalogIDs: result.resolvedCatalogIDs,
+            resolvedArtworkURLs: result.resolvedArtworkURLs,
+            trackedProviderIDs: trackedArtists.map(\.providerID)
+        )
 
         let notificationsEnabled = defaults.object(forKey: AppSettings.notificationsEnabled) as? Bool ?? true
         let upcomingNotificationsEnabled = defaults.object(forKey: AppSettings.upcomingReleaseNotificationsEnabled) as? Bool ?? true
@@ -179,7 +176,8 @@ struct ReleaseRefreshService {
                 preferenceByArtist: preferenceByArtist,
                 genresByArtist: genresByArtistID,
                 globalPreference: globalPreference
-            )
+            ),
+            artistUpdates: artistUpdates
         )
 
         if let storageFailure = upsert.storageFailure {

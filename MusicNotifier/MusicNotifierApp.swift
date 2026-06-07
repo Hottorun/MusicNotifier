@@ -16,6 +16,7 @@ struct MusicNotifierApp: App {
     @State private var refreshCoordinator = RefreshCoordinator()
     @StateObject private var navigationDepth = TabNavigationDepth()
     @AppStorage(AppSettings.appearance) private var appearanceRaw: String = "system"
+    @Environment(\.scenePhase) private var scenePhase
 
     private var preferredScheme: ColorScheme? {
         switch appearanceRaw {
@@ -102,6 +103,15 @@ struct MusicNotifierApp: App {
                 .environment(refreshCoordinator)
                 .environmentObject(navigationDepth)
                 .preferredColorScheme(preferredScheme)
+                .onChange(of: scenePhase) { _, newPhase in
+                    // Flush any pending debounced SwiftData save before the
+                    // app heads to background so we never lose a write.
+                    if newPhase == .background || newPhase == .inactive {
+                        Task { @MainActor in
+                            ModelContextSaveDebouncer.shared.flush()
+                        }
+                    }
+                }
                 .task {
                     BackgroundRefreshScheduler.scheduleDailyRefresh()
                     // Force the widget extension to re-evaluate its timeline on

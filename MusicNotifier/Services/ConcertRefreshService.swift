@@ -14,11 +14,11 @@ struct ConcertRefreshSummary {
 
 @MainActor
 struct ConcertRefreshService {
-    func refresh(
-        trackedArtists: [ArtistData],
-        modelContext: ModelContext
-    ) async -> ConcertRefreshSummary {
-        let inputs = trackedArtists.map {
+    /// Inputs that should be fed to `BandsintownService.fetchConcerts`.
+    /// Exposed so callers (e.g. the foreground coordinator) can kick the
+    /// network work off in parallel with the release fetch.
+    nonisolated static func fetchInputs(from trackedArtists: [ArtistData]) -> [ArtistFetchInput] {
+        trackedArtists.map {
             ArtistFetchInput(
                 providerID: $0.providerID,
                 name: $0.name,
@@ -26,8 +26,20 @@ struct ConcertRefreshService {
                 catalogArtistID: $0.catalogArtistID
             )
         }
+    }
 
-        let fetched = await BandsintownService().fetchConcerts(for: inputs)
+    func refresh(
+        trackedArtists: [ArtistData],
+        modelContext: ModelContext,
+        prefetched: [FetchedConcert]? = nil
+    ) async -> ConcertRefreshSummary {
+        let fetched: [FetchedConcert]
+        if let prefetched {
+            fetched = prefetched
+        } else {
+            let inputs = Self.fetchInputs(from: trackedArtists)
+            fetched = await BandsintownService().fetchConcerts(for: inputs)
+        }
         guard !fetched.isEmpty else { return ConcertRefreshSummary(newConcertCount: 0) }
 
         let defaults = UserDefaults.standard
