@@ -555,13 +555,19 @@ struct HomeView: View {
                 }
                 .padding(.top, 4)
             }
-            .navigationTitle("Feed")
-            .navigationBarTitleDisplayMode(.large)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    headerActionButtons(derived: derived)
-                }
-            }
+            // "FEED" and its actions are drawn as one row by `header(…)`,
+            // not by the navigation bar, because no system title mode puts
+            // them on the same level: `.large` lays the title out on its own
+            // row *beneath* the toolbar, and a custom leading item in
+            // `.inline` gets squeezed by the system until it truncates
+            // ("FE…").
+            //
+            // The bar itself is left empty and inline so it collapses to a
+            // thin strip carrying just the search field. An empty *large*
+            // title still reserves its full row, which left a dead gap above
+            // the header with the search field stranded in the middle of it.
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
             .appScreenBackground()
             // Value-based navigation so AlbumView (with its @StateObject preview
             // player and queries) is only instantiated when the user actually
@@ -738,6 +744,20 @@ struct HomeView: View {
 
     private func header(derived: DerivedReleases) -> some View {
         VStack(alignment: .leading, spacing: 10) {
+            // Title and its actions on one row. `.firstTextBaseline` would
+            // drag the icon buttons off-centre, so both sides are centred on
+            // the row instead.
+            HStack(alignment: .center, spacing: 10) {
+                Text("FEED")
+                    .font(AppFont.display(34, .heavy))
+                    .tracking(0.5)
+                    .foregroundStyle(AppTheme.primaryText)
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityLabel("Feed")
+                Spacer(minLength: 8)
+                headerActionButtons(derived: derived)
+            }
+
             // Unread count is the only feed-relevant metric here — artist and
             // upcoming totals belong to their own tabs. The "Feed" title now
             // lives in the native nav bar so it collapses to a small pill on
