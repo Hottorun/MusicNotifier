@@ -60,8 +60,8 @@ private enum WidgetPalette {
         }
     }
     static var accentSoft: Color { accent.opacity(0.16) }
-    static let darkSurface = Color(red: 0.07, green: 0.07, blue: 0.08)
-    static let darkElevatedSurface = Color(red: 0.15, green: 0.15, blue: 0.17)
+    static let darkSurface = Color(red: 0.078, green: 0.078, blue: 0.098)
+    static let darkElevatedSurface = Color(red: 0.125, green: 0.125, blue: 0.153)
 }
 
 // MARK: - Provider
@@ -301,7 +301,7 @@ struct ReleaseHomeWidgetView: View {
                 Spacer(minLength: 0)
 
                 Text(release.title)
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .font(.system(size: 16, weight: .bold).width(.condensed))
                     .foregroundStyle(heroForeground)
                     .lineLimit(2)
                 Text(release.artistName)
@@ -425,7 +425,7 @@ struct ReleaseHomeWidgetView: View {
                             .tracking(0.8)
                             .foregroundStyle(WidgetPalette.accent)
                         Text(hero.title)
-                            .font(.system(size: 17, weight: .bold, design: .rounded))
+                            .font(.system(size: 18, weight: .bold).width(.condensed))
                             .foregroundStyle(.primary)
                             .lineLimit(2)
                         Text(hero.artistName)

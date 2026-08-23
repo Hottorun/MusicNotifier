@@ -359,48 +359,54 @@ struct AlbumView: View {
                 .aspectRatio(1, contentMode: .fit)
                 .frame(maxWidth: 280)
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(AppTheme.hairline, lineWidth: 1)
+                )
             }
             .buttonStyle(.plain)
             .shadow(color: .black.opacity(0.45), radius: 22, y: 10)
 
-            VStack(spacing: 6) {
-                Text(ReleaseTitleFormatter.displayTitle(title))
-                    .font(.system(size: 24, weight: .bold, design: .rounded))
-                    .foregroundStyle(AppTheme.primaryText)
-                    .multilineTextAlignment(.center)
-                    .lineLimit(3)
-
-                // Only a link when we can actually resolve a stored artist —
+            VStack(spacing: 8) {
+                // Artist above title, matching the scan order used on every
+                // feed row — you look for who, then what.
+                // Only a link when we can actually resolve a stored artist:
                 // the old Button rendered a chevron unconditionally and then
                 // silently did nothing when no match existed.
                 if let linkedArtist {
                     NavigationLink(value: linkedArtist) {
-                        HStack(spacing: 4) {
-                            Text(artistName)
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(AppTheme.primaryText)
-                                .lineLimit(2)
-                                .multilineTextAlignment(.center)
+                        HStack(spacing: 3) {
+                            EyebrowText(text: artistName, color: AppTheme.accent, size: 13)
                             Image(systemName: "chevron.right")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(AppTheme.secondary)
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(AppTheme.accent.opacity(0.7))
                         }
                     }
                     .buttonStyle(.plain)
                 } else {
-                    Text(artistName)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(AppTheme.primaryText)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.center)
+                    EyebrowText(text: artistName, color: AppTheme.accent, size: 13)
                 }
 
+                Text(ReleaseTitleFormatter.displayTitle(title))
+                    .font(AppFont.condensed(30, .bold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(3)
+                    .minimumScaleFactor(0.8)
+                    .padding(.horizontal, 12)
+
                 HStack(spacing: 6) {
-                    Text(formattedReleaseDate)
-                        .font(.footnote)
+                    Text(formattedReleaseDate.uppercased())
+                        .font(AppFont.display(12, .bold))
+                        .tracking(0.8)
                         .foregroundStyle(AppTheme.secondary)
                     if let kind = release?.kind {
                         ReleaseTypeBadge(kind: kind)
+                    }
+                    // Upcoming albums get the same countdown chip the
+                    // Upcoming tab uses, so the two surfaces agree.
+                    if let date = release?.releaseDate, ReleaseCountdown.days(to: date) > 0 {
+                        CountdownChip(date: date)
                     }
                 }
             }
@@ -438,8 +444,11 @@ struct AlbumView: View {
                         Image(systemName: "play.fill")
                         Text("Play")
                     }
-                    .font(.subheadline.weight(.bold))
-                    .foregroundStyle(AppTheme.primaryText)
+                    .font(AppFont.text(15, .bold))
+                    // Sits on the accent fill, so it needs its own color —
+                    // `primaryText` resolved to near-black on red in light
+                    // mode.
+                    .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
                     .frame(height: 46)
                     .background(Capsule().fill(AppTheme.accent))
@@ -456,12 +465,13 @@ struct AlbumView: View {
                             .lineLimit(1)
                             .minimumScaleFactor(0.8)
                     }
-                    .font(.subheadline.weight(.semibold))
+                    .font(AppFont.text(15, .semibold))
                     .foregroundStyle(AppTheme.primaryText)
                     .frame(maxWidth: .infinity)
                     .frame(height: 46)
                     .padding(.horizontal, 14)
                     .background(Capsule().fill(AppTheme.surface))
+                    .overlay(Capsule().strokeBorder(AppTheme.hairline, lineWidth: 1))
                 }
             }
         }

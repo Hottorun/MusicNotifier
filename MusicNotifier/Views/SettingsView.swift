@@ -98,9 +98,9 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("NOTIFICATIONS")
-                        .font(.caption.weight(.semibold))
-                        .tracking(1.2)
-                        .foregroundStyle(AppTheme.secondary)
+                        .font(AppFont.display(13, .heavy))
+                        .tracking(1.3)
+                        .foregroundStyle(AppTheme.primaryText)
                         .padding(.horizontal, 24)
 
                     VStack(spacing: 0) {
@@ -289,13 +289,16 @@ struct SettingsView: View {
     private func statTile(value: String, label: String, accent: Bool = false) -> some View {
         VStack(spacing: 4) {
             Text(value)
-                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .font(AppFont.display(30, .heavy)).monospacedDigit()
                 .foregroundStyle(accent ? AppTheme.accent : AppTheme.primaryText)
-            Text(label)
-                .font(.caption)
+            Text(label.uppercased())
+                .font(AppFont.display(10, .bold))
+                .tracking(0.9)
                 .foregroundStyle(AppTheme.secondary)
         }
         .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(value) \(label)")
     }
 
     private var tileDivider: some View {
@@ -307,9 +310,9 @@ struct SettingsView: View {
     private func section<Content: View>(title: String, tint: Color = AppTheme.secondary, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title.uppercased())
-                .font(.caption.weight(.semibold))
-                .tracking(1.2)
-                .foregroundStyle(tint == AppTheme.secondary ? AppTheme.secondary : tint)
+                .font(AppFont.display(13, .heavy))
+                .tracking(1.3)
+                .foregroundStyle(tint == AppTheme.secondary ? AppTheme.primaryText : tint)
                 .padding(.horizontal, 24)
 
             VStack(spacing: 0) {

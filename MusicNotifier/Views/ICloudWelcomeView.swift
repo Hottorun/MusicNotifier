@@ -32,7 +32,7 @@ struct ICloudWelcomeView: View {
 
                 VStack(spacing: 10) {
                     Text("Welcome back")
-                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                        .font(AppFont.display(34, .heavy))
                         .foregroundStyle(AppTheme.primaryText)
                     Text("We found your watchlist on iCloud.")
                         .font(.body)
@@ -76,7 +76,7 @@ struct ICloudWelcomeView: View {
     private func statTile(value: String, label: String) -> some View {
         VStack(spacing: 4) {
             Text(value)
-                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .font(AppFont.display(30, .heavy)).monospacedDigit()
                 .foregroundStyle(AppTheme.primaryText)
             Text(label)
                 .font(.caption)

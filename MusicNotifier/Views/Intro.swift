@@ -20,7 +20,15 @@ struct Intro: View {
     // User explicitly chose "I already have a watchlist in iCloud — wait
     // for it" — drives the ICloudSyncWaitingView takeover.
     @State private var isWaitingForICloud = false
-    
+
+    /// Today's date under the wordmark — the same rule that anchors the Feed
+    /// and Upcoming lists, introduced on the very first screen.
+    private static let introDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "d MMMM"
+        return f
+    }()
+
     var body: some View {
         NavigationStack {
             if isWaitingForICloud {
@@ -35,27 +43,32 @@ struct Intro: View {
                 VStack(spacing: 0) {
                     Spacer()
 
-                    VStack(spacing: 20) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                                .fill(AppTheme.accent)
-                                .frame(width: 96, height: 96)
-                            Image(systemName: "bell.and.waves.left.and.right.fill")
-                                .font(.system(size: 38, weight: .semibold))
+                    // Opens on the app's own device rather than an app-icon
+                    // restatement: a stacked wordmark cut off by the dated
+                    // rule that runs through the whole product. The first
+                    // screen should look like the thing it's selling.
+                    VStack(alignment: .leading, spacing: 18) {
+                        VStack(alignment: .leading, spacing: -10) {
+                            Text("MUSIC")
+                                .font(AppFont.display(64, .heavy))
                                 .foregroundStyle(AppTheme.primaryText)
+                            Text("NOTIFIER")
+                                .font(AppFont.display(64, .heavy))
+                                .foregroundStyle(AppTheme.accent)
                         }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Music Notifier")
 
-                        VStack(spacing: 10) {
-                            Text("Music Notifier")
-                                .font(.system(size: 34, weight: .bold, design: .rounded))
-                                .foregroundStyle(AppTheme.primaryText)
-                            Text("Track artists. Get notified when they drop new music.")
-                                .font(.body)
-                                .foregroundStyle(AppTheme.secondary)
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal, 32)
-                        }
+                        TodayDivider(label: Self.introDateFormatter.string(from: Date()))
+
+                        Text("Every release from every artist you follow, the day it lands.")
+                            .font(AppFont.text(16))
+                            .foregroundStyle(AppTheme.secondary)
+                            .lineSpacing(3)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24)
 
                     Spacer()
 
@@ -105,11 +118,15 @@ struct Intro: View {
                                 Image(systemName: "icloud.fill")
                                     .font(.footnote)
                                 Text("I already have a watchlist in iCloud")
-                                    .font(.footnote.weight(.semibold))
+                                    .font(AppFont.text(13, .semibold))
                             }
                         }
                         .buttonStyle(.plain)
-                        .foregroundStyle(AppTheme.accent)
+                        // Neutral, not accent. This is the rarely-used escape
+                        // hatch; with the wordmark and the CTA already in
+                        // accent, a third red element made the screen read as
+                        // three competing calls to action.
+                        .foregroundStyle(AppTheme.secondary)
                         .padding(.top, 8)
                     }
                     .padding(.horizontal, 20)
@@ -130,29 +147,46 @@ struct Intro: View {
                 .set(name, forKey: AppSettings.selectedMusicProvider)
             authorizationMessage = nil
         } label: {
-            VStack(spacing: 12) {
+            // Compact row rather than a tall tile. With one provider this is
+            // a statement of what the app connects to, not a real choice —
+            // it shouldn't outweigh the Continue button beneath it.
+            HStack(spacing: 12) {
                 Image(imageName)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 88, height: 88)
+                    .frame(width: 40, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
 
-                Text(name)
-                    .font(.headline)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(name)
+                        .font(AppFont.text(15, .semibold))
+                        .foregroundStyle(AppTheme.primaryText)
+                    if !isAvailable {
+                        Text("Not available")
+                            .font(AppFont.text(12))
+                            .foregroundStyle(AppTheme.secondary)
+                    }
+                }
 
-                if !isAvailable {
-                    Text("Not available")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+
+                if selectedItem == name && isAvailable {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(AppTheme.accent)
                 }
             }
-            .fontDesign(.rounded)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 18)
-            .background(selectedItem == name ? AppTheme.elevatedSurface : AppTheme.surface)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(AppTheme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: AppTheme.Radius.control, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(selectedItem == name ? AppTheme.accent : Color.clear, lineWidth: 2)
+                RoundedRectangle(cornerRadius: AppTheme.Radius.control, style: .continuous)
+                    .strokeBorder(
+                        selectedItem == name ? AppTheme.accent.opacity(0.5) : AppTheme.hairline,
+                        lineWidth: 1
+                    )
             }
             .opacity(isAvailable ? 1.0 : 0.55)
         }
@@ -261,7 +295,7 @@ private struct OnboardingArtistImportView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Pick the artists you follow")
-                .font(.system(size: 26, weight: .bold, design: .rounded))
+                .font(AppFont.display(30, .heavy))
                 .foregroundStyle(AppTheme.primaryText)
             Text("Import from Apple Music, then tap the bell beside each artist you want release alerts for.")
                 .font(.subheadline)

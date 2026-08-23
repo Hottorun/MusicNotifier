@@ -271,9 +271,15 @@ struct UpcomingView: View {
 
     private func headerView(upcomingCount: Int) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Upcoming")
-                .font(.system(size: 36, weight: .bold, design: .rounded))
+            Text("UPCOMING")
+                .font(AppFont.display(40, .heavy))
+                .tracking(0.5)
                 .foregroundStyle(AppTheme.primaryText)
+
+            // The anchor: everything below this rule is still to come. In a
+            // list made entirely of future dates, marking where "now" sits is
+            // what makes the countdowns mean something.
+            TodayDivider(label: "Today \(Self.todayStampFormatter.string(from: Date()))")
 
             HStack(spacing: 8) {
                 // `.white` made the count invisible on the light background.
@@ -294,15 +300,26 @@ struct UpcomingView: View {
         Circle().fill(AppTheme.secondary.opacity(0.6)).frame(width: 3, height: 3)
     }
 
+    /// "d MMM" stamp used in the header's today rule.
+    fileprivate static let todayStampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "d MMM"
+        return f
+    }()
+
     private func inlineMetric(value: Int, label: String, color: Color) -> some View {
         HStack(spacing: 4) {
             Text("\(value)")
-                .font(.caption.weight(.bold))
+                .font(AppFont.display(16, .heavy))
+                .monospacedDigit()
                 .foregroundStyle(color)
-            Text(label)
-                .font(.caption)
+            Text(label.uppercased())
+                .font(AppFont.display(11, .bold))
+                .tracking(0.9)
                 .foregroundStyle(AppTheme.secondary)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(value) \(label)")
     }
 
     private var layoutToggle: some View {
@@ -319,10 +336,11 @@ struct UpcomingView: View {
             if next == .calendar { selectedDay = Calendar.current.startOfDay(for: Date()) }
         } label: {
             Image(systemName: layout.systemImage)
-                .font(.footnote.weight(.semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(AppTheme.secondary)
-                .frame(width: 30, height: 30)
+                .frame(width: 34, height: 34)
                 .background(Capsule().fill(AppTheme.surface))
+                .overlay(Capsule().strokeBorder(AppTheme.hairline, lineWidth: 1))
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Layout: \(layout.rawValue)")
@@ -337,9 +355,9 @@ struct UpcomingView: View {
         LazyVStack(alignment: .leading, spacing: 18) {
         ForEach(monthBuckets(from: upcoming), id: \.label) { bucket in
             LazyVStack(alignment: .leading, spacing: 10) {
-                SectionHeader(title: bucket.label)
-                    .padding(.horizontal, 20)
-                LazyVStack(spacing: 12) {
+                SectionHeader(title: bucket.label, count: bucket.releases.count)
+                    .padding(.horizontal, AppTheme.Space.gutter)
+                LazyVStack(spacing: AppTheme.Space.rowGap) {
                     ForEach(bucket.releases) { release in
                         NavigationLink(value: release) {
                             UpcomingRow(release: release)
@@ -347,7 +365,7 @@ struct UpcomingView: View {
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 20)
+                .padding(.horizontal, AppTheme.Space.gutter)
             }
         }
         }
@@ -359,9 +377,9 @@ struct UpcomingView: View {
         let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
         return ForEach(monthBuckets(from: upcoming), id: \.label) { bucket in
             VStack(alignment: .leading, spacing: 10) {
-                SectionHeader(title: bucket.label)
-                    .padding(.horizontal, 20)
-                LazyVGrid(columns: columns, spacing: 14) {
+                SectionHeader(title: bucket.label, count: bucket.releases.count)
+                    .padding(.horizontal, AppTheme.Space.gutter)
+                LazyVGrid(columns: columns, spacing: 16) {
                     ForEach(bucket.releases) { release in
                         NavigationLink(value: release) {
                             UpcomingGridCard(release: release)
@@ -369,7 +387,7 @@ struct UpcomingView: View {
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 20)
+                .padding(.horizontal, AppTheme.Space.gutter)
             }
         }
     }
@@ -433,10 +451,10 @@ struct UpcomingView: View {
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(month.formatted(.dateTime.month(.wide)))
-                    .font(.system(size: 26, weight: .bold, design: .rounded))
+                    .font(AppFont.display(28, .heavy))
                     .foregroundStyle(AppTheme.primaryText)
                 Text(month.formatted(.dateTime.year()))
-                    .font(.system(size: 18, weight: .semibold, design: .rounded))
+                    .font(AppFont.display(20, .bold)).monospacedDigit()
                     .foregroundStyle(AppTheme.secondary)
                 if isCurrentMonth {
                     Text("NOW")
@@ -535,40 +553,37 @@ struct UpcomingView: View {
 
     // MARK: - End-of-list footer
 
+    /// Closes the list the same way the header opens it — with a rule. The
+    /// schedule has a start and an end, and saying so stops the user from
+    /// wondering whether more is still loading.
     private func endOfListFooter(count: Int) -> some View {
-        VStack(spacing: 6) {
-            Image(systemName: "checkmark.circle")
-                .font(.title3)
-                .foregroundStyle(AppTheme.secondary.opacity(0.7))
-            Text("That's all upcoming")
-                .font(.footnote.weight(.semibold))
+        HStack(spacing: 10) {
+            Rectangle()
+                .fill(AppTheme.hairline)
+                .frame(height: 1)
+            Text("\(count) SCHEDULED")
+                .font(AppFont.display(11, .heavy))
+                .tracking(1.2)
+                .monospacedDigit()
                 .foregroundStyle(AppTheme.secondary)
-            Text("\(count) release\(count == 1 ? "" : "s") on the horizon")
-                .font(.caption)
-                .foregroundStyle(AppTheme.secondary.opacity(0.7))
+            Rectangle()
+                .fill(AppTheme.hairline)
+                .frame(height: 1)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 18)
+        .padding(.horizontal, AppTheme.Space.gutter)
+        .padding(.top, 14)
     }
 
     // MARK: - Empty state
 
     private var emptyState: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "calendar")
-                .font(.largeTitle)
-                .foregroundStyle(AppTheme.secondary)
-            Text("No upcoming releases")
-                .font(.headline)
-                .foregroundStyle(AppTheme.primaryText)
-            Text("Tracked artists with announced future releases will show up here.")
-                .font(.footnote)
-                .foregroundStyle(AppTheme.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 36)
+        AppEmptyState(
+            title: "Nothing announced",
+            message: "When a tracked artist announces a release date, it lands here with a countdown.",
+            systemImage: "calendar"
+        ) {
+            EmptyView()
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 36)
     }
 
     // MARK: - Month bucketing
@@ -640,9 +655,11 @@ private struct CalendarDayCell: View {
                 VStack(spacing: 0) {
                     Spacer(minLength: 0)
                     Text("\(Calendar.current.component(.day, from: date))")
-                        .font(.system(size: hasReleases ? 16 : 14,
-                                      weight: isToday ? .heavy : (hasReleases ? .bold : .semibold),
-                                      design: .rounded))
+                        .font(AppFont.display(
+                            hasReleases ? 18 : 16,
+                            isToday ? .heavy : (hasReleases ? .bold : .semibold)
+                        ))
+                        .monospacedDigit()
                         .foregroundStyle(numberColor)
                     Spacer(minLength: 0)
                     if hasReleases {
@@ -722,75 +739,66 @@ private struct UpcomingRow: View {
         // the calendar button hard against the right edge. Bottom tier:
         // single inline metadata line "[icon] Album · 3 days" — gives both
         // the kind and the countdown room without crowding the title.
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 12) {
-                dateStamp
+        HStack(alignment: .top, spacing: 10) {
+            // Same rail as the Feed, so both tabs share one left edge. The
+            // rail is neutral even here: previously every upcoming row wore
+            // an accent-filled date tile, which meant nothing stood out.
+            // Urgency now lives in the countdown chip alone.
+            DateRail(date: release.releaseDate, showsWeekday: true)
+                .padding(.top, 2)
 
-                CachedAsyncImage(url: release.artworkURL) {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(AppTheme.elevatedSurface)
-                        .overlay {
-                            Image(systemName: "music.note")
-                                .foregroundStyle(AppTheme.secondary)
-                        }
-                }
-                .frame(width: 72, height: 72)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(release.artistName.uppercased())
-                        .font(.caption2.weight(.semibold))
-                        .tracking(0.8)
-                        .foregroundStyle(AppTheme.accent)
-                        .lineLimit(1)
-
-                    Text(ReleaseTitleFormatter.displayTitle(release.title))
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                        .foregroundStyle(AppTheme.primaryText)
-                        // `reservesSpace: true` keeps the title slot two
-                        // lines tall regardless of how short the text is,
-                        // so every row has a uniform height instead of
-                        // jumping between one and two visual lines.
-                        .lineLimit(2, reservesSpace: true)
-                        .multilineTextAlignment(.leading)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                AddToCalendarButton(release: release)
+            CachedAsyncImage(url: release.artworkURL) {
+                RoundedRectangle(cornerRadius: AppTheme.Radius.tile, style: .continuous)
+                    .fill(AppTheme.elevatedSurface)
+                    .overlay {
+                        Image(systemName: "music.note")
+                            .foregroundStyle(AppTheme.secondary)
+                    }
             }
+            .frame(width: 64, height: 64)
+            .clipShape(RoundedRectangle(cornerRadius: AppTheme.Radius.tile, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: AppTheme.Radius.tile, style: .continuous)
+                    .strokeBorder(AppTheme.hairline, lineWidth: 1)
+            )
 
-            // Bottom inline meta strip — two capsules: [type icon Album] [3 days].
-            HStack(spacing: 6) {
-                HStack(spacing: 4) {
-                    Image(systemName: typeIconName)
-                        .font(.caption2)
-                    Text(release.type.capitalized)
-                        .font(.caption.weight(.medium))
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(AppTheme.elevatedSurface))
-                .foregroundStyle(AppTheme.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                EyebrowText(text: release.artistName)
 
-                if let date = release.releaseDate {
-                    let imminent = isImminent(date: date)
-                    Text(countdownText(for: date))
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Capsule().fill(imminent ? AppTheme.accent : AppTheme.elevatedSurface))
-                        .foregroundStyle(imminent ? .white : AppTheme.secondary)
+                Text(ReleaseTitleFormatter.displayTitle(release.title))
+                    .font(AppFont.text(15, .semibold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    // `reservesSpace: true` keeps the title slot two lines
+                    // tall regardless of how short the text is, so every row
+                    // has a uniform height instead of jumping between one and
+                    // two visual lines.
+                    .lineLimit(2, reservesSpace: true)
+                    .multilineTextAlignment(.leading)
+
+                HStack(spacing: 6) {
+                    HStack(spacing: 4) {
+                        Image(systemName: typeIconName)
+                            .font(.system(size: 9, weight: .bold))
+                        Text(release.type.uppercased())
+                            .font(AppFont.display(10, .heavy))
+                            .tracking(0.7)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(AppTheme.elevatedSurface))
+                    .foregroundStyle(AppTheme.secondary)
+
+                    if let date = release.releaseDate {
+                        CountdownChip(date: date)
+                    }
+                    Spacer(minLength: 0)
                 }
-                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            AddToCalendarButton(release: release)
         }
-        .padding(10)
-        .padding(.trailing, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(AppTheme.surface)
-        )
+        .appCard(padding: 10)
         .contextMenu {
             // Order: primary → share → state action → destructive (last).
             if let url = release.albumURL {
@@ -841,42 +849,6 @@ private struct UpcomingRow: View {
         }
     }
 
-    /// Mixed-case countdown string for the inline meta line. Same logic as
-    private func isImminent(date: Date) -> Bool { ReleaseCountdown.isImminent(date) }
-    private func countdownText(for date: Date) -> String { ReleaseCountdown.inlineLabel(for: date) }
-
-    private var dateStamp: some View {
-        let date = release.releaseDate
-        let imminent: Bool = {
-            guard let date else { return false }
-            let days = Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: Date()), to: Calendar.current.startOfDay(for: date)).day ?? 0
-            return days >= 0 && days <= 7
-        }()
-        let fg: Color = imminent ? .white : AppTheme.accent
-        let bg: Color = imminent ? AppTheme.accent : AppTheme.accentSoft
-
-        return VStack(spacing: 0) {
-            Text(date.map { $0.formatted(.dateTime.month(.abbreviated)) }?.uppercased() ?? "TBA")
-                .font(.caption2.weight(.heavy))
-                .tracking(1.0)
-                .foregroundStyle(fg.opacity(imminent ? 0.95 : 1))
-                .padding(.top, 6)
-            Spacer(minLength: 0)
-            Text(date.map { "\(Calendar.current.component(.day, from: $0))" } ?? "—")
-                .font(.system(size: 26, weight: .heavy, design: .rounded))
-                .foregroundStyle(fg)
-                .minimumScaleFactor(0.7)
-                .lineLimit(1)
-            Spacer(minLength: 0)
-            Text(date.map { $0.formatted(.dateTime.weekday(.abbreviated)) }?.uppercased() ?? "")
-                .font(.caption2.weight(.semibold))
-                .tracking(0.6)
-                .foregroundStyle(fg.opacity(0.75))
-                .padding(.bottom, 6)
-        }
-        .frame(width: 58, height: 72)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(bg))
-    }
 }
 
 /// Inline circular button — taps add the release to the user's iOS Calendar
@@ -972,46 +944,9 @@ enum ReleaseCountdown {
     }
 }
 
-/// Compact inline countdown that sits alongside the release type tag.
-private struct InlineCountdown: View {
-    let date: Date
-
-    var body: some View {
-        let imminent = ReleaseCountdown.isImminent(date)
-        let released = ReleaseCountdown.days(to: date) < 0
-
-        HStack(spacing: 4) {
-            Image(systemName: released ? "checkmark.circle.fill" : (imminent ? "flame.fill" : "clock"))
-                .font(.caption2.weight(.bold))
-            Text(ReleaseCountdown.label(for: date))
-                .font(.caption2.weight(.bold))
-                .tracking(0.3)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-        }
-        .foregroundStyle(imminent ? AppTheme.accent : AppTheme.secondary)
-    }
-}
-
-/// Top-right "in X days" pill. Within 7 days → accent (red); further out →
-/// neutral dark capsule.
-private struct CountdownPill: View {
-    let date: Date
-
-    var body: some View {
-        let isImminent = ReleaseCountdown.isImminent(date)
-        let bg = isImminent ? AppTheme.accent : AppTheme.elevatedSurface
-        let fg: Color = isImminent ? .white : AppTheme.secondary
-
-        Text(ReleaseCountdown.label(for: date))
-            .font(.caption2.weight(.bold))
-            .tracking(0.3)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .foregroundStyle(fg)
-            .background(Capsule().fill(bg))
-    }
-}
+// Countdown rendering now lives in `CountdownChip` (AppTheme.swift) so the
+// Feed, Upcoming, and the album detail page all draw the same chip from the
+// same `ReleaseCountdown` rules.
 
 // MARK: - Grid card
 
@@ -1029,23 +964,23 @@ private struct UpcomingGridCard: View {
                     }
             }
             .aspectRatio(1, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: AppTheme.Radius.heroTile, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: AppTheme.Radius.heroTile, style: .continuous)
+                    .strokeBorder(AppTheme.hairline, lineWidth: 1)
+            )
             .overlay(alignment: .topTrailing) {
                 if let date = release.releaseDate {
-                    CountdownPill(date: date)
+                    CountdownChip(date: date, prominent: true)
                         .padding(6)
                 }
             }
 
             HStack(alignment: .top, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(release.artistName.uppercased())
-                        .font(.caption2.weight(.semibold))
-                        .tracking(0.6)
-                        .foregroundStyle(AppTheme.secondary)
-                        .lineLimit(1)
+                    EyebrowText(text: release.artistName, size: 10)
                     Text(ReleaseTitleFormatter.displayTitle(release.title))
-                        .font(.subheadline.weight(.semibold))
+                        .font(AppFont.text(14, .semibold))
                         .foregroundStyle(AppTheme.primaryText)
                         .lineLimit(1)
                 }

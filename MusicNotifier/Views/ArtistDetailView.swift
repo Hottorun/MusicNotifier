@@ -153,10 +153,12 @@ struct ArtistDetailView: View {
             // clock it had already chosen. The back button carries its own
             // glass background for contrast.
             VStack(alignment: .leading, spacing: 6) {
-                Text(artist.name)
-                    .font(.system(size: 32, weight: .heavy, design: .rounded))
+                Text(artist.name.uppercased())
+                    .font(AppFont.display(38, .heavy))
+                    .tracking(0.4)
                     .foregroundStyle(AppTheme.primaryText)
                     .lineLimit(2)
+                    .minimumScaleFactor(0.7)
                     .multilineTextAlignment(.leading)
 
                 HStack(spacing: 6) {
@@ -186,9 +188,17 @@ struct ArtistDetailView: View {
     // background — so they use the normal text palette rather than white.
     private func heroMetric(_ value: String, _ label: String) -> some View {
         HStack(spacing: 4) {
-            Text(value).foregroundStyle(AppTheme.primaryText).fontWeight(.bold)
-            Text(label).foregroundStyle(AppTheme.secondary)
+            Text(value)
+                .font(AppFont.display(14, .heavy))
+                .monospacedDigit()
+                .foregroundStyle(AppTheme.primaryText)
+            Text(label.uppercased())
+                .font(AppFont.display(10, .bold))
+                .tracking(0.8)
+                .foregroundStyle(AppTheme.secondary)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(value) \(label)")
     }
 
     private var heroDot: some View {

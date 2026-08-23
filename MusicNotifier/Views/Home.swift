@@ -514,12 +514,37 @@ struct HomeView: View {
                         )
                     } else {
                         if !derived.newReleases.isEmpty {
-                            // Hybrid mode keeps the punchy grid for New + compact
-                            // rows for Past; the other two modes are uniform.
-                            if feedLayoutRaw == "hybrid" {
-                                heroNewReleasesSection(derived.newReleases)
-                            } else {
-                                releaseGroup("New", releases: derived.newReleases)
+                            // Anything that landed *today* is pulled above the
+                            // rest and introduced by the OUT TODAY rule. It's
+                            // the one question this app exists to answer, and
+                            // burying it in a generic "New" list wasted the
+                            // only fact we know that a streaming app doesn't.
+                            let (outToday, restOfNew) = partitionOutToday(derived.newReleases)
+
+                            if !outToday.isEmpty {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    TodayDivider(label: "Out today")
+                                        .padding(.horizontal, AppTheme.Space.gutter)
+                                    LazyVStack(spacing: AppTheme.Space.rowGap) {
+                                        ForEach(outToday) { release in
+                                            NavigationLink(value: release) {
+                                                heroListRow(release)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                    .padding(.horizontal, AppTheme.Space.gutter)
+                                }
+                            }
+
+                            if !restOfNew.isEmpty {
+                                // Hybrid mode keeps the punchy grid for New + compact
+                                // rows for Past; the other two modes are uniform.
+                                if feedLayoutRaw == "hybrid" {
+                                    heroNewReleasesSection(restOfNew)
+                                } else {
+                                    releaseGroup("New", releases: restOfNew)
+                                }
                             }
                         }
                         pastReleasesByMonth(derived.pastAndSeen)
@@ -792,10 +817,11 @@ struct HomeView: View {
             feedLayoutRaw = nextLayout(after: feedLayoutRaw)
         } label: {
             Image(systemName: layoutIcon(for: feedLayoutRaw))
-                .font(.subheadline.weight(.semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(AppTheme.secondary)
-                .frame(width: 38, height: 38)
+                .frame(width: 34, height: 34)
                 .background(Capsule().fill(AppTheme.surface))
+                .overlay(Capsule().strokeBorder(AppTheme.hairline, lineWidth: 1))
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Layout: \(feedLayoutRaw)")
@@ -834,21 +860,25 @@ struct HomeView: View {
                 }
             }
         } label: {
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
                 Image(systemName: isAll
-                      ? "line.3.horizontal.decrease.circle"
+                      ? "line.3.horizontal.decrease"
                       : "line.3.horizontal.decrease.circle.fill")
-                    .font(.subheadline.weight(.semibold))
-                Text(releaseKindFilter.rawValue)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.system(size: 12, weight: .bold))
+                Text(releaseKindFilter.rawValue.uppercased())
+                    .font(AppFont.display(12, .heavy))
+                    .tracking(0.8)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
             .foregroundStyle(isAll ? AppTheme.secondary : palette.fg)
-            .padding(.horizontal, 14)
-            .frame(height: 38)
+            .padding(.horizontal, 12)
+            .frame(height: 34)
             .background(
                 Capsule().fill(isAll ? AppTheme.surface : palette.bg)
+            )
+            .overlay(
+                Capsule().strokeBorder(isAll ? AppTheme.hairline : palette.fg.opacity(0.35), lineWidth: 1)
             )
         }
         .accessibilityLabel("Filter releases by type")
@@ -898,12 +928,16 @@ struct HomeView: View {
     private func inlineMetric(value: Int, label: String, color: Color) -> some View {
         HStack(spacing: 4) {
             Text("\(value)")
-                .font(.caption.weight(.bold))
+                .font(AppFont.display(16, .heavy))
+                .monospacedDigit()
                 .foregroundStyle(color)
-            Text(label)
-                .font(.caption)
+            Text(label.uppercased())
+                .font(AppFont.display(11, .bold))
+                .tracking(0.9)
                 .foregroundStyle(AppTheme.secondary)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(value) \(label)")
     }
 
 
@@ -914,27 +948,7 @@ struct HomeView: View {
         primary: EmptyStateAction? = nil,
         secondary: EmptyStateAction? = nil
     ) -> some View {
-        VStack(spacing: 14) {
-            ZStack {
-                Circle()
-                    .fill(AppTheme.accentSoft)
-                    .frame(width: 64, height: 64)
-                Image(systemName: systemImage)
-                    .font(.system(size: 26, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
-            }
-
-            VStack(spacing: 6) {
-                Text(title)
-                    .font(.headline)
-                    .foregroundStyle(AppTheme.primaryText)
-                Text(message)
-                    .font(.footnote)
-                    .foregroundStyle(AppTheme.secondary)
-                    .multilineTextAlignment(.center)
-            }
-            .padding(.horizontal, 16)
-
+        AppEmptyState(title: title, message: message, systemImage: systemImage) {
             if primary != nil || secondary != nil {
                 HStack(spacing: 10) {
                     if let primary {
@@ -950,12 +964,8 @@ struct HomeView: View {
                         .buttonStyle(GhostButtonStyle())
                     }
                 }
-                .padding(.top, 4)
             }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 36)
-        .padding(.horizontal, 24)
     }
 
     private func isRefreshFailure(_ message: String) -> Bool {
@@ -974,8 +984,8 @@ struct HomeView: View {
         Group {
             if !releases.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
-                    SectionHeader(title: title)
-                        .padding(.horizontal, 18)
+                    SectionHeader(title: title, count: releases.count)
+                        .padding(.horizontal, AppTheme.Space.gutter)
 
                     if feedLayoutRaw == "grid" {
                         // 2-column grid using the same hero-style card.
@@ -1068,6 +1078,23 @@ struct HomeView: View {
         }
     }
 
+    /// Splits today's drops off the front of the New bucket. Single pass, and
+    /// `newReleases` only ever holds unseen items, so this stays cheap even
+    /// right after a first import.
+    private func partitionOutToday(_ releases: [ReleaseData]) -> (today: [ReleaseData], rest: [ReleaseData]) {
+        let calendar = Calendar.current
+        var today: [ReleaseData] = []
+        var rest: [ReleaseData] = []
+        for release in releases {
+            if let date = release.releaseDate, calendar.isDateInToday(date) {
+                today.append(release)
+            } else {
+                rest.append(release)
+            }
+        }
+        return (today, rest)
+    }
+
     private struct MonthBucket {
         let label: String
         let releases: [ReleaseData]
@@ -1076,6 +1103,14 @@ struct HomeView: View {
     private static let monthBucketFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "MMMM yyyy"
+        return f
+    }()
+
+    /// Compact "12 MAR" stamp for grid cards — the grid's stand-in for the
+    /// list layout's date rail.
+    fileprivate static let gridDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "d MMM"
         return f
     }()
 
@@ -1103,9 +1138,9 @@ struct HomeView: View {
         // covers in a row always share a baseline.
         let columns = [GridItem(.flexible(), spacing: 12, alignment: .top), GridItem(.flexible(), spacing: 12, alignment: .top)]
         return VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "New")
-                .padding(.horizontal, 18)
-            LazyVGrid(columns: columns, spacing: 14) {
+            SectionHeader(title: "New", count: releases.count)
+                .padding(.horizontal, AppTheme.Space.gutter)
+            LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(releases) { release in
                     NavigationLink(value: release) {
                         heroGridCard(release)
@@ -1134,14 +1169,23 @@ struct HomeView: View {
                         releaseArtworkPlaceholder(release)
                     }
                 }
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: AppTheme.Radius.heroTile, style: .continuous))
+                // Hairline on the artwork itself. Album covers with white or
+                // very pale edges used to bleed into the light-mode
+                // background with no visible boundary.
+                .overlay(
+                    RoundedRectangle(cornerRadius: AppTheme.Radius.heroTile, style: .continuous)
+                        .strokeBorder(AppTheme.hairline, lineWidth: 1)
+                )
                 .overlay(alignment: .topTrailing) {
                     if !release.isSeen {
-                        Circle()
-                            .fill(AppTheme.accent)
-                            .frame(width: 10, height: 10)
-                            .overlay(Circle().stroke(AppTheme.background, lineWidth: 2))
-                            .padding(8)
+                        UnreadMark(size: 9)
+                            .padding(3)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    .fill(AppTheme.background)
+                            )
+                            .padding(7)
                     }
                 }
                 .overlay(alignment: .bottomLeading) {
@@ -1149,22 +1193,33 @@ struct HomeView: View {
                         LabelSourceBadge().padding(6)
                     }
                 }
+                // Date stamped into the card's bottom-right, so the grid
+                // carries the same "when" the list rail does.
+                .overlay(alignment: .bottomTrailing) {
+                    if let date = release.releaseDate {
+                        Text(Self.gridDateFormatter.string(from: date).uppercased())
+                            .font(AppFont.display(10, .heavy))
+                            .tracking(0.8)
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(.black.opacity(0.55)))
+                            .padding(6)
+                    }
+                }
 
-            // Fixed-size metadata block: two reserved title lines (most
-            // release titles are longer than one line at this column width
-            // and were being cut mid-word) plus a reserved badge slot, so
-            // singles — which render no badge — don't produce shorter cards
-            // than their row neighbours.
-            VStack(alignment: .leading, spacing: 4) {
+            // Fixed-size metadata block: artist eyebrow, then two reserved
+            // title lines (most release titles are longer than one line at
+            // this column width and were being cut mid-word), plus a
+            // reserved badge slot so singles — which render no badge — don't
+            // produce shorter cards than their row neighbours.
+            VStack(alignment: .leading, spacing: 3) {
+                EyebrowText(text: release.artistName, size: 10)
                 Text(ReleaseTitleFormatter.displayTitle(release.title))
-                    .font(.subheadline.weight(.semibold))
+                    .font(AppFont.text(14, .semibold))
                     .foregroundStyle(AppTheme.primaryText)
                     .lineLimit(2, reservesSpace: true)
                     .multilineTextAlignment(.leading)
-                Text(release.artistName)
-                    .font(.caption)
-                    .foregroundStyle(AppTheme.secondary)
-                    .lineLimit(1)
                 ReleaseTypeBadge(kind: release.kind)
                     .frame(height: 16, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1181,112 +1236,109 @@ struct HomeView: View {
         }
     }
 
+    /// Standard feed row. The left date rail is the structural device that
+    /// makes the whole feed scan as a dated schedule — and because every rail
+    /// is the same fixed width, the artwork and titles align down the entire
+    /// list. Artist sits in the eyebrow position above the title: in a
+    /// release radar you scan for *who* first, then for what.
     private func releaseRow(_ release: ReleaseData) -> some View {
-        HStack(spacing: 12) {
+        let isOutToday = release.releaseDate.map { Calendar.current.isDateInToday($0) } ?? false
+        return HStack(spacing: 10) {
+            DateRail(date: release.releaseDate, isToday: isOutToday)
+
             CachedAsyncImage(url: release.artworkURL) {
                 releaseArtworkPlaceholder(release)
             }
-            .frame(width: 58, height: 58)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .frame(width: 56, height: 56)
+            .clipShape(RoundedRectangle(cornerRadius: AppTheme.Radius.tile, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(ReleaseTitleFormatter.displayTitle(release.title))
-                    .font(.subheadline.weight(release.isSeen ? .regular : .semibold))
-                    .foregroundStyle(AppTheme.primaryText)
-                    .lineLimit(1)
-                HStack(spacing: 6) {
-                    Text(release.artistName)
-                        .font(.footnote)
-                        .foregroundStyle(AppTheme.secondary)
-                        .lineLimit(1)
+            // Exactly two lines, always. Singles render no type badge and
+            // most rows have no "via" source, so a third metadata line
+            // collapsed on those rows and left the list ragged. Folding the
+            // badge and source up beside the artist keeps every row the same
+            // height — which is what makes a long feed scannable.
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    EyebrowText(text: release.artistName)
+                    ReleaseTypeBadge(kind: release.kind)
                     if labelArtistIDs.contains(release.artistProviderID) {
                         LabelSourceBadge()
                     }
+                    if let via = viaTrackedArtistName(for: release) {
+                        Text("via \(via)")
+                            .font(AppFont.text(11, .semibold))
+                            .foregroundStyle(AppTheme.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
                 }
-                if let via = viaTrackedArtistName(for: release) {
-                    Text("via \(via)")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(AppTheme.accent)
-                        .lineLimit(1)
-                }
-                HStack(spacing: 6) {
-                    Text(release.formattedReleaseDate)
-                        .font(.caption2)
-                        .foregroundStyle(AppTheme.secondary)
-                    ReleaseTypeBadge(kind: release.kind)
-                }
+                Text(ReleaseTitleFormatter.displayTitle(release.title))
+                    .font(AppFont.text(15, release.isSeen ? .regular : .semibold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .lineLimit(1)
             }
 
-            Spacer()
+            Spacer(minLength: 4)
 
             if !release.isSeen {
-                Circle()
-                    .fill(AppTheme.accent)
-                    .frame(width: 7, height: 7)
+                UnreadMark()
             }
         }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(AppTheme.surface)
-        )
+        .appCard(padding: 10)
         .contextMenu { releaseContextMenu(release) } preview: { releaseContextMenuPreview(release) }
     }
 
-    /// Hero list row: larger artwork, artist name in accent above the title.
-    /// Used for the top-most item in the "New" section in list layout so the
-    /// most recent drop reads as more important than the rest of the list.
+    /// Hero list row: the most recent drop, given the full compressed
+    /// treatment. Same rail as every other row so it stays on the feed's
+    /// left edge instead of breaking the column.
     private func heroListRow(_ release: ReleaseData) -> some View {
-        HStack(spacing: 14) {
+        let isOutToday = release.releaseDate.map { Calendar.current.isDateInToday($0) } ?? false
+        return HStack(alignment: .top, spacing: 10) {
+            DateRail(date: release.releaseDate, isToday: isOutToday)
+                .padding(.top, 2)
+
             CachedAsyncImage(url: release.artworkURL) {
                 releaseArtworkPlaceholder(release)
             }
-            .frame(width: 92, height: 92)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .frame(width: 96, height: 96)
+            .clipShape(RoundedRectangle(cornerRadius: AppTheme.Radius.heroTile, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 5) {
-                Text(release.artistName.uppercased())
-                    .font(.caption.weight(.heavy))
-                    .tracking(0.8)
-                    .foregroundStyle(AppTheme.accent)
-                    .lineLimit(1)
-
-                Text(ReleaseTitleFormatter.displayTitle(release.title))
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                    .foregroundStyle(AppTheme.primaryText)
-                    .lineLimit(3)
-                    .multilineTextAlignment(.leading)
-
-                if let via = viaTrackedArtistName(for: release) {
-                    Text("via \(via)")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(AppTheme.accent)
-                        .lineLimit(1)
-                }
-
-                HStack(spacing: 6) {
-                    Text(release.formattedReleaseDate)
-                        .font(.caption2)
-                        .foregroundStyle(AppTheme.secondary)
-                    ReleaseTypeBadge(kind: release.kind)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    EyebrowText(text: release.artistName, color: AppTheme.accent, size: 12)
                     if labelArtistIDs.contains(release.artistProviderID) {
                         LabelSourceBadge()
                     }
                 }
+
+                // Condensed rather than fully compressed: hero titles run
+                // long, and full compression at 3 lines gets hard to read.
+                Text(ReleaseTitleFormatter.displayTitle(release.title))
+                    .font(AppFont.condensed(24, .bold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .lineLimit(3)
+                    .minimumScaleFactor(0.85)
+                    .multilineTextAlignment(.leading)
+
+                HStack(spacing: 6) {
+                    ReleaseTypeBadge(kind: release.kind)
+                    if let via = viaTrackedArtistName(for: release) {
+                        Text("via \(via)")
+                            .font(AppFont.text(11, .semibold))
+                            .foregroundStyle(AppTheme.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.top, 1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
             if !release.isSeen {
-                Circle()
-                    .fill(AppTheme.accent)
-                    .frame(width: 9, height: 9)
+                UnreadMark(size: 8)
+                    .padding(.top, 4)
             }
         }
-        .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(AppTheme.surface)
-        )
+        .appCard(padding: 12)
         .contextMenu { releaseContextMenu(release) } preview: { releaseContextMenuPreview(release) }
     }
 

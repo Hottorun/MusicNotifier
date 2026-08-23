@@ -382,7 +382,7 @@ private struct FeaturedVideoCard: View {
                     .lineLimit(1)
 
                 Text(video.title)
-                    .font(.system(size: 24, weight: .heavy, design: .rounded))
+                    .font(AppFont.condensed(26, .bold))
                     .foregroundStyle(AppTheme.primaryText)
                     .lineLimit(3)
                     .multilineTextAlignment(.leading)
@@ -483,7 +483,7 @@ private struct VideoPosterRow: View {
                         .foregroundStyle(AppTheme.accent)
                         .lineLimit(1)
                     Text(video.title)
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .font(AppFont.text(15, .semibold))
                         .foregroundStyle(AppTheme.primaryText)
                         .lineLimit(2)
                     HStack(spacing: 6) {

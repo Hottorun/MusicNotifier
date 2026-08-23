@@ -512,7 +512,7 @@ struct Artists: View {
             // strip so the user's finger isn't covering it.
             if let scrubLetter {
                 Text(scrubLetter)
-                    .font(.system(size: 36, weight: .bold, design: .rounded))
+                    .font(AppFont.display(38, .heavy))
                     .foregroundStyle(AppTheme.primaryText)
                     .frame(width: 70, height: 70)
                     .background(Circle().fill(AppTheme.elevatedSurface))
@@ -929,15 +929,17 @@ struct Artists: View {
                         .frame(width: 22, height: 22)
                         .overlay(
                             Image(systemName: "sparkles")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(AppTheme.primaryText)
+                                // On the accent fill — `primaryText` resolved
+                                // to near-black on red in light mode.
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white)
                         )
                         .overlay(Circle().stroke(AppTheme.background, lineWidth: 2))
                         .offset(x: 2, y: 2)
                 }
             }
             Text(artist.name)
-                .font(.caption.weight(.semibold))
+                .font(AppFont.text(12, .semibold))
                 .foregroundStyle(AppTheme.primaryText)
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
@@ -1197,14 +1199,14 @@ struct Artists: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(artist.name)
-                    .font(.subheadline.weight(.semibold))
+                    .font(AppFont.text(15, .semibold))
                     .foregroundStyle(AppTheme.primaryText)
                     .lineLimit(1)
                 // Show last-checked relative time instead of provider name — more
                 // useful info, and provider is implicit when the library is mono-provider.
                 if let lastCheckedAt = artist.lastCheckedAt {
                     Text("Checked \(lastCheckedAt.formatted(.relative(presentation: .named)))")
-                        .font(.caption2)
+                        .font(AppFont.text(11))
                         .foregroundStyle(AppTheme.secondary)
                         .lineLimit(1)
                 }
@@ -1220,7 +1222,7 @@ struct Artists: View {
                 // `.white` on `elevatedSurface` was white-on-light-grey in
                 // light mode, so a tracked artist looked *untracked*.
                 Image(systemName: artist.isTracked ? "bell.fill" : "bell")
-                    .font(.subheadline.weight(.semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(artist.isTracked ? AppTheme.accent : AppTheme.secondary)
                     .frame(width: 36, height: 36)
                     .background(
@@ -1231,12 +1233,8 @@ struct Artists: View {
             .buttonStyle(.plain)
             .accessibilityLabel(artist.isTracked ? "Stop tracking \(artist.name)" : "Track \(artist.name)")
         }
-        .padding(10)
         .frame(height: 64)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(AppTheme.surface)
-        )
+        .appCard(radius: AppTheme.Radius.control, padding: 10)
     }
 
     private var importSheet: some View {
