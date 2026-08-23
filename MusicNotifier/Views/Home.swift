@@ -152,11 +152,9 @@ struct HomeView: View {
     @State private var showingSettings = false
     @State private var showingRefreshDetail = false
     @State private var releaseSearchText = ""
-    /// Drives the `.searchable` presentation state so we can force the bar
-    /// hidden when the user leaves and returns to the tab. Without this the
-    /// drawer would stay visible from a previous session because the scroll
-    /// position is at the top.
-    @State private var isSearchPresented = false
+    /// Focus for the in-header search field, so leaving the tab also dismisses
+    /// the keyboard rather than returning to a half-open search session.
+    @FocusState private var isSearchFocused: Bool
     /// Debounced mirror of releaseSearchText. `derived` reads this instead of the
     /// raw search text so the (potentially thousands of releases) filter loop
     /// doesn't re-run on every keystroke.
@@ -555,19 +553,22 @@ struct HomeView: View {
                 }
                 .padding(.top, 4)
             }
-            // "FEED" and its actions are drawn as one row by `header(…)`,
-            // not by the navigation bar, because no system title mode puts
-            // them on the same level: `.large` lays the title out on its own
-            // row *beneath* the toolbar, and a custom leading item in
-            // `.inline` gets squeezed by the system until it truncates
-            // ("FE…").
+            // The whole header — title, actions, counts, filters, search — is
+            // drawn in the scroll content, so this screen has no use for a
+            // navigation bar and hiding it reclaims the strip it reserved.
             //
-            // The bar itself is left empty and inline so it collapses to a
-            // thin strip carrying just the search field. An empty *large*
-            // title still reserves its full row, which left a dead gap above
-            // the header with the search field stranded in the middle of it.
+            // Why not the system chrome: `.large` lays its title out on its
+            // own row *beneath* the toolbar (which is what put "Feed" a level
+            // below its buttons), a custom leading title in `.inline` gets
+            // squeezed until it truncates ("FE…"), and `.searchable` only
+            // accepts navigation-bar placements — so the field could never
+            // sit *under* the header while the system owned it.
+            //
+            // Pushed destinations declare their own bars, so the back button
+            // on AlbumView / ArtistDetailView is unaffected.
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.hidden, for: .navigationBar)
             .appScreenBackground()
             // Value-based navigation so AlbumView (with its @StateObject preview
             // player and queries) is only instantiated when the user actually
@@ -582,14 +583,10 @@ struct HomeView: View {
             .navigationDestination(for: ArtistData.self) { artist in
                 ArtistDetailView(artist: artist)
             }
-            // System search bar — hidden at rest, revealed by a pull-down
-            // gesture at the top of the scroll view (matches Videos tab).
-            .searchable(text: $releaseSearchText, isPresented: $isSearchPresented, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search releases")
             .onDisappear {
-                // Hide and clear the search drawer on tab away — when the user
-                // comes back, the feed reads "fresh" instead of resuming a
-                // stale search session.
-                isSearchPresented = false
+                // Clear the search on tab away — when the user comes back,
+                // the feed reads "fresh" instead of resuming a stale search.
+                isSearchFocused = false
                 releaseSearchText = ""
                 debouncedSearchText = ""
             }
@@ -616,11 +613,11 @@ struct HomeView: View {
                     debouncedSearchText = newValue
                 }
             }
-            // Standard `.refreshable` integrates cleanly with `.searchable`
-            // and gives the user the platform pull-to-refresh affordance.
-            // The previous custom DragGesture raced with the search bar's
-            // pull-to-reveal — overloading the same gesture for both made
-            // the search field surface unintentionally during pulls.
+            // Standard `.refreshable` gives the user the platform
+            // pull-to-refresh affordance. The custom DragGesture this
+            // replaced used to race with the search bar's pull-to-reveal;
+            // with the search field now in the header there is nothing left
+            // for the pull to collide with.
             .refreshable {
                 guard !refreshCoordinator.isRefreshing, !trackedArtists.isEmpty else { return }
                 startRefresh()
@@ -759,9 +756,7 @@ struct HomeView: View {
             }
 
             // Unread count is the only feed-relevant metric here — artist and
-            // upcoming totals belong to their own tabs. The "Feed" title now
-            // lives in the native nav bar so it collapses to a small pill on
-            // scroll (matches the Videos tab).
+            // upcoming totals belong to their own tabs.
             HStack(spacing: 10) {
                 // Pale yellow failed contrast on the light background (and
                 // "0 unread" shouldn't shout anyway) — accent only when there
@@ -785,12 +780,14 @@ struct HomeView: View {
                 typeFilterChip
             }
 
-            // Progress is now shown by the toolbar refresh icon (which fills
-            // as a circular arc) — much less screen real-estate. Tap the
-            // toolbar icon while refreshing to bring up the full detail card
-            // (current artist, X/Y count, stop button).
+            searchField
+
+            // Progress is shown by the refresh icon (which fills as a
+            // circular arc) — much less screen real-estate. Tap it while
+            // refreshing for the full detail card (current artist, X/Y
+            // count, stop button).
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, AppTheme.Space.gutter)
     }
 
     /// Search / refresh / more buttons, rendered inline at the right of the
@@ -825,6 +822,47 @@ struct HomeView: View {
             }
             .accessibilityLabel("More")
         }
+    }
+
+    /// In-content search field. Replaces `.searchable`, which could only be
+    /// placed in the navigation bar and so always sat *above* the title
+    /// rather than under the header where it belongs. Owning the field also
+    /// let the navigation bar be hidden entirely.
+    ///
+    /// The debounce, the derived-feed filtering, and the clear-on-tab-away
+    /// behaviour are unchanged — they were already driven by
+    /// `releaseSearchText` rather than by the system control.
+    private var searchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(AppTheme.secondary)
+
+            TextField("Search releases", text: $releaseSearchText)
+                .font(AppFont.text(15))
+                .foregroundStyle(AppTheme.primaryText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+                .focused($isSearchFocused)
+
+            if !releaseSearchText.isEmpty {
+                Button {
+                    releaseSearchText = ""
+                    debouncedSearchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 15))
+                        .foregroundStyle(AppTheme.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 38)
+        .background(Capsule().fill(AppTheme.surface))
+        .overlay(Capsule().strokeBorder(AppTheme.hairline, lineWidth: 1))
     }
 
     /// Three-state layout toggle: hybrid → list → grid → hybrid.
