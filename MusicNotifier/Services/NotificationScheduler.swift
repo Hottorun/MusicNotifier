@@ -18,6 +18,22 @@ struct ReleaseNotificationSpec: Sendable {
     let releaseDate: Date
     let artworkURL: URL?
 
+    init(
+        providerID: String,
+        artistProviderID: String,
+        artistName: String,
+        title: String,
+        releaseDate: Date,
+        artworkURL: URL? = nil
+    ) {
+        self.providerID = providerID
+        self.artistProviderID = artistProviderID
+        self.artistName = artistName
+        self.title = title
+        self.releaseDate = releaseDate
+        self.artworkURL = artworkURL
+    }
+
     init?(from release: ReleaseData) {
         guard let releaseDate = release.releaseDate else { return nil }
         self.providerID = release.providerID
@@ -98,13 +114,27 @@ struct NotificationScheduler {
         try? await UNUserNotificationCenter.current().add(request)
     }
 
-    func schedulePreReleaseAlerts(spec: ReleaseNotificationSpec, hour: Int, minute: Int) async {
-        guard spec.releaseDate > Date() else { return }
+    /// Pre-alert offsets the user configured in Settings, as day counts.
+    static func configuredPreAlertDays() -> [Int] {
         let raw = UserDefaults.standard.string(forKey: AppSettings.releasePreAlertDays) ?? ""
-        let daysBefore = raw
+        return raw
             .split(separator: ",")
             .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
             .filter { $0 > 0 }
+    }
+
+    /// - Parameter limitedTo: when non-nil, only these day offsets are
+    ///   scheduled. `syncUpcomingReleaseAlerts` uses it to stay inside the
+    ///   system's pending-request budget.
+    func schedulePreReleaseAlerts(
+        spec: ReleaseNotificationSpec,
+        hour: Int,
+        minute: Int,
+        limitedTo: Set<Int>? = nil
+    ) async {
+        guard spec.releaseDate > Date() else { return }
+        var daysBefore = Self.configuredPreAlertDays()
+        if let limitedTo { daysBefore = daysBefore.filter(limitedTo.contains) }
         guard !daysBefore.isEmpty else { return }
 
         let calendar = Calendar.current
@@ -310,6 +340,111 @@ struct NotificationScheduler {
         )
 
         try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    /// iOS keeps at most **64** pending local notification requests per app and
+    /// silently discards everything past that — and *it* picks the survivors,
+    /// not us. A watchlist of a few hundred artists, each release also
+    /// generating one request per configured pre-alert offset, blows past 64
+    /// in a single refresh, so release-day alerts the user actually cares
+    /// about could be evicted in favour of arbitrary others.
+    ///
+    /// Budget leaves headroom for the daily summary and the Settings test
+    /// notification, which live outside this pipeline.
+    static let releaseRequestBudget = 56
+
+    /// Schedules upcoming-release alerts nearest-first within the system's
+    /// pending-request budget, and prunes any previously-scheduled release
+    /// request that no longer makes the cut (or whose release is gone).
+    ///
+    /// Replaces the previous unbounded "loop over every spec and add" —
+    /// which both overflowed the cap and left orphaned requests pending for
+    /// releases that had since been deleted or dismissed.
+    /// One local-notification request the scheduler intends to have pending.
+    struct PlannedRequest: Equatable, Sendable {
+        let identifier: String
+        let fireDate: Date
+        let specIndex: Int
+        /// `nil` for the release-day alert; otherwise the pre-alert offset.
+        let preAlertDay: Int?
+    }
+
+    /// Pure planning step, split out from `syncUpcomingReleaseAlerts` so the
+    /// nearest-first ordering and the budget cut-off are unit-testable
+    /// without touching `UNUserNotificationCenter`.
+    static func planReleaseRequests(
+        specs: [ReleaseNotificationSpec],
+        preAlertDays: [Int],
+        now: Date,
+        calendar: Calendar = .current,
+        budget: Int = releaseRequestBudget
+    ) -> [PlannedRequest] {
+        var planned: [PlannedRequest] = []
+        for (index, spec) in specs.enumerated() {
+            planned.append(
+                PlannedRequest(
+                    identifier: "release-\(spec.providerID)",
+                    fireDate: spec.releaseDate,
+                    specIndex: index,
+                    preAlertDay: nil
+                )
+            )
+            guard spec.releaseDate > now else { continue }
+            for days in preAlertDays {
+                guard let alertDate = calendar.date(byAdding: .day, value: -days, to: spec.releaseDate),
+                      alertDate > now else { continue }
+                planned.append(
+                    PlannedRequest(
+                        identifier: "release-\(spec.providerID)-prealert-\(days)",
+                        fireDate: alertDate,
+                        specIndex: index,
+                        preAlertDay: days
+                    )
+                )
+            }
+        }
+        // Sort on the *fire* date, not the release date, so an imminent
+        // 1-day pre-alert outranks a release day months out.
+        planned.sort { $0.fireDate < $1.fireDate }
+        return Array(planned.prefix(max(0, budget)))
+    }
+
+    func syncUpcomingReleaseAlerts(specs: [ReleaseNotificationSpec], hour: Int, minute: Int) async {
+        let center = UNUserNotificationCenter.current()
+        let kept = Self.planReleaseRequests(
+            specs: specs,
+            preAlertDays: Self.configuredPreAlertDays(),
+            now: Date()
+        )
+        let keptIdentifiers = Set(kept.map(\.identifier))
+
+        // Drop stale release requests first so the adds below never race the
+        // cap against requests we're about to discard anyway.
+        let stale = await center.pendingNotificationRequests()
+            .map(\.identifier)
+            .filter { $0.hasPrefix("release-") && !keptIdentifiers.contains($0) }
+        if !stale.isEmpty {
+            center.removePendingNotificationRequests(withIdentifiers: stale)
+        }
+
+        // Group the survivors by spec so each release schedules its day
+        // alert and its surviving pre-alerts in one pass.
+        var releaseDayIndices: Set<Int> = []
+        var preAlertsBySpec: [Int: Set<Int>] = [:]
+        for entry in kept {
+            if let day = entry.preAlertDay {
+                preAlertsBySpec[entry.specIndex, default: []].insert(day)
+            } else {
+                releaseDayIndices.insert(entry.specIndex)
+            }
+        }
+
+        for index in releaseDayIndices.sorted() {
+            await scheduleReleaseDayNotification(spec: specs[index], hour: hour, minute: minute)
+        }
+        for (index, days) in preAlertsBySpec {
+            await schedulePreReleaseAlerts(spec: specs[index], hour: hour, minute: minute, limitedTo: days)
+        }
     }
 
     func cancelReleaseNotifications() async {

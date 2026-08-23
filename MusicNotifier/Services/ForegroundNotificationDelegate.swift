@@ -24,6 +24,41 @@ extension Notification.Name {
     static let musicNotifierOpenSettings = Notification.Name("musicNotifierOpenSettings")
 }
 
+/// Parking spot for a deep link that arrived before the UI was listening.
+///
+/// On a cold launch from a notification tap, `didReceive` fires while the scene
+/// is still being built — often before `ContentView` has subscribed to
+/// `.musicNotifierDeepLinkTapped`. A bare `NotificationCenter.post` at that
+/// moment goes nowhere and the tap is silently dropped, which for this app
+/// means "I tapped a new-release alert and it just opened the Feed." The
+/// delegate parks the URL here as well as posting it, and ContentView drains it
+/// on appear, so no ordering loses the tap.
+@MainActor
+enum PendingDeepLink {
+    private static var stored: (url: URL, receivedAt: Date)?
+
+    /// A parked tap is only worth honouring briefly — surfacing an album the
+    /// user tapped several minutes ago would be surprising, not helpful.
+    private static let maxAge: TimeInterval = 60
+
+    static func store(_ url: URL) {
+        stored = (url, Date())
+    }
+
+    /// Returns and clears the parked link, if it's still fresh.
+    static func take() -> URL? {
+        guard let entry = stored else { return nil }
+        stored = nil
+        guard Date().timeIntervalSince(entry.receivedAt) < maxAge else { return nil }
+        return entry.url
+    }
+
+    /// Drop the parked link because a live post already handled it.
+    static func clear() {
+        stored = nil
+    }
+}
+
 /// Without this delegate, iOS suppresses notifications while the app is in the foreground.
 /// Setting it as `UNUserNotificationCenter.current().delegate` ensures the test notification
 /// and same-day release alerts actually show as banners even when the user is in the app.
@@ -53,7 +88,13 @@ final class ForegroundNotificationDelegate: NSObject, UNUserNotificationCenterDe
         }()
 
         if let url {
-            NotificationCenter.default.post(name: .musicNotifierDeepLinkTapped, object: url)
+            // Park *and* post: the park covers a cold launch where nothing is
+            // subscribed yet, the post covers a tap while the app is already
+            // on screen. Whichever lands first clears the other.
+            Task { @MainActor in
+                PendingDeepLink.store(url)
+                NotificationCenter.default.post(name: .musicNotifierDeepLinkTapped, object: url)
+            }
         }
         completionHandler()
     }

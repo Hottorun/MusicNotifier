@@ -12,7 +12,12 @@ enum AppTheme {
     // card/section structure reads at a glance under either appearance.
     private static func adaptive(dark: UIColor, light: UIColor) -> Color {
         Color(uiColor: UIColor { trait in
-            trait.userInterfaceStyle == .light ? light : dark
+            // Only `.dark` gets the dark value. The previous
+            // `== .light ? light : dark` also mapped `.unspecified` to dark,
+            // so any resolution without a real trait collection — UIKit
+            // chrome like a toolbar background, widget snapshots — silently
+            // came back near-black on an otherwise light screen.
+            trait.userInterfaceStyle == .dark ? dark : light
         })
     }
 

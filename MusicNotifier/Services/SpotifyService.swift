@@ -210,12 +210,13 @@ struct SpotifyService {
                 ]
             )
 
+            // Spotify's albums endpoint has no date filter, so the recency
+            // window is applied client-side. Year- and month-precision dates
+            // parse to the start of that period, which puts them outside the
+            // window unless they're genuinely this week.
             let mapped = response.items.compactMap { album -> FetchedRelease? in
                 let releaseDate = Self.parseReleaseDate(album.releaseDate, precision: album.releaseDatePrecision)
-                if let releaseDate {
-                    let daysFromRelease = Calendar.current.dateComponents([.day], from: releaseDate, to: Date()).day ?? 0
-                    if releaseDate < Date() && daysFromRelease > 365 { return nil }
-                }
+                guard ReleaseRecencyGate.isWithinWindow(releaseDate) else { return nil }
 
                 return FetchedRelease(
                     providerID: MusicProvider.spotify.scopedID(album.id),
@@ -323,7 +324,7 @@ struct SpotifyService {
         }
 
         let bodyPreview = String(data: data.prefix(500), encoding: .utf8) ?? "<binary>"
-        print("[Spotify] \(path) → HTTP \(http.statusCode), body=\(bodyPreview)")
+        Log.v("[Spotify] \(path) → HTTP \(http.statusCode), body=\(bodyPreview)")
 
         // 401 → token expired/invalid. Drop the cached token so accessToken() forces a refresh,
         // then retry once. After the retry, give up so we don't loop.

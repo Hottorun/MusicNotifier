@@ -187,13 +187,19 @@ struct VideosView: View {
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 9)
+                    // Selection reads as accent-on-accentSoft, matching the
+                    // tab bar, the Artists filter chips and the tracked-bell
+                    // affordance. Filling with `primaryText` made the selected
+                    // chip a solid black pill in light mode — legible, but the
+                    // only control in the app that signalled "selected" that
+                    // way.
                     .background(
-                        Capsule().fill(filter == option ? AppTheme.primaryText : AppTheme.elevatedSurface)
+                        Capsule().fill(filter == option ? AppTheme.accentSoft : AppTheme.elevatedSurface)
                     )
                     .overlay(
-                        Capsule().stroke(filter == option ? Color.clear : AppTheme.hairline, lineWidth: 1)
+                        Capsule().stroke(filter == option ? AppTheme.accent.opacity(0.5) : AppTheme.hairline, lineWidth: 1)
                     )
-                    .foregroundStyle(filter == option ? AppTheme.background : AppTheme.primaryText.opacity(0.85))
+                    .foregroundStyle(filter == option ? AppTheme.accent : AppTheme.primaryText.opacity(0.85))
                 }
                 .buttonStyle(.plain)
             }
@@ -384,7 +390,7 @@ private struct FeaturedVideoCard: View {
                 if let date = video.releaseDate {
                     Text(date, style: .date)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.7))
+                        .foregroundStyle(AppTheme.secondary)
                 }
             }
             .padding(16)
@@ -493,7 +499,7 @@ private struct VideoPosterRow: View {
                         }
                     }
                     .font(.caption2.weight(.medium))
-                    .foregroundStyle(.white.opacity(0.65))
+                    .foregroundStyle(AppTheme.secondary)
                 }
                 Spacer(minLength: 0)
                 if !video.isSeen {

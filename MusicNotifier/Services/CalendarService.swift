@@ -78,21 +78,12 @@ struct CalendarService {
         return event.eventIdentifier ?? ""
     }
 
+    /// Full access is the only path we need — the deployment target is well
+    /// past iOS 17. The pre-17 `requestAccess(to:)` fallback used to live here,
+    /// but referencing it also dragged in a `NSCalendarsUsageDescription`
+    /// requirement for a branch that could never run.
     private func requestAccess() async throws {
-        if #available(iOS 17.0, *) {
-            let granted = try await store.requestFullAccessToEvents()
-            guard granted else { throw CalendarAddError.denied }
-        } else {
-            let granted: Bool = try await withCheckedThrowingContinuation { continuation in
-                store.requestAccess(to: .event) { granted, error in
-                    if let error = error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume(returning: granted)
-                    }
-                }
-            }
-            guard granted else { throw CalendarAddError.denied }
-        }
+        let granted = try await store.requestFullAccessToEvents()
+        guard granted else { throw CalendarAddError.denied }
     }
 }

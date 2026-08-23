@@ -17,6 +17,12 @@ enum AppSettings {
     static let lastBackgroundRefreshAt = "lastBackgroundRefreshAt"
     static let lastBackgroundRefreshResult = "lastBackgroundRefreshResult"
     static let lastStorefrontCountryCode = "lastStorefrontCountryCode"
+    /// Last observed `MusicAuthorization.Status.rawValue`. Written by the
+    /// launch + foreground auth re-check in `MusicNotifierApp`; read by
+    /// any view that needs to gate UI on whether MusicKit access is still
+    /// granted (refresh button, empty states, etc.).
+    static let lastKnownMusicAuthStatus = "lastKnownMusicAuthStatus"
+    static let lastKnownMusicAuthCheckedAt = "lastKnownMusicAuthCheckedAt"
     /// MUST match the `com.apple.security.application-groups` entry in both
     /// MusicNotifier.entitlements and MusicNotifierWidgets.entitlements. Mismatch
     /// silently sends writes/reads to nonexistent containers — widget shows no data.

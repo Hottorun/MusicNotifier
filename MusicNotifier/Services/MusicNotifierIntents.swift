@@ -13,9 +13,19 @@ import SwiftData
 @MainActor
 enum IntentDataAccess {
     static func makeContainer() throws -> ModelContainer {
-        let schema = Schema([Item.self, ArtistData.self, ReleaseData.self])
-        let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-        return try ModelContainer(for: schema, configurations: [configuration])
+        // Must match the app exactly — see `AppSchema` for why a subset schema
+        // here was destructive rather than merely incomplete.
+        let schema = AppSchema.make()
+        if let container = try? ModelContainer(
+            for: schema,
+            configurations: [AppSchema.cloudConfiguration(for: schema)]
+        ) {
+            return container
+        }
+        return try ModelContainer(
+            for: schema,
+            configurations: [AppSchema.localConfiguration(for: schema)]
+        )
     }
 
     static func trackedArtistIDs(in container: ModelContainer) -> Set<String> {
@@ -123,7 +133,14 @@ struct MarkAllSeenIntent: AppIntent {
             predicate: #Predicate { !$0.isSeen }
         )
         let unread = (try? context.fetch(descriptor)) ?? []
-        unread.forEach { $0.isSeen = true }
+        let now = Date()
+        unread.forEach {
+            $0.isSeen = true
+            // Bump `lastUpdatedAt` so CloudKit recognizes this as the
+            // most recent write to the row — without it, an in-flight
+            // refresh on another device can resurrect the unread state.
+            $0.lastUpdatedAt = now
+        }
         try? context.save()
 
         return .result(dialog: IntentDialog("Marked \(unread.count) release\(unread.count == 1 ? "" : "s") as seen."))

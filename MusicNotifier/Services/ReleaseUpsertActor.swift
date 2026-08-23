@@ -69,6 +69,12 @@ actor ReleaseUpsertActor {
         var newReleasesData: [ReleaseData] = []
         var dateChangedData: [ReleaseData] = []
 
+        // Hard recency gate. Every fetch path already narrows its query, but
+        // this is the only place releases become rows — enforcing it here
+        // means no path (present or future) can leak a stale drop into the
+        // feed.
+        let fetchedReleases = ReleaseRecencyGate.filter(fetchedReleases, now: now)
+
         do {
             // Bounded fetch: only pull ReleaseData rows whose `providerID`
             // appears in the current fetched batch. The dedup key is
@@ -258,6 +264,226 @@ actor ReleaseUpsertActor {
                 }
             )
             let widgetReleases = (try? modelContext.fetch(widgetDescriptor)) ?? Array(existingByID.values)
+            let (snapshot, requests) = WidgetSnapshotWriter.captureSnapshot(from: widgetReleases)
+            output.widgetSnapshot = snapshot
+            output.widgetRequests = requests
+        } catch {
+            output.storageFailure = error.localizedDescription
+        }
+
+        return output
+    }
+
+    // MARK: - Streaming refresh (incremental UI)
+
+    /// Sendable batch-flush result. The coordinator accumulates these across
+    /// the refresh and hands them to `finalize` so notification specs +
+    /// widget snapshot are built once at end-of-refresh, not per batch.
+    struct BatchOutput: Sendable {
+        var newReleaseIDs: [String] = []
+        var dateChangedIDs: [String] = []
+        var newReleaseCount: Int = 0
+        var updatedReleaseCount: Int = 0
+        var storageFailure: String?
+    }
+
+    /// Upsert + save for a single fetched-release batch. Skips notifications,
+    /// widget snapshot, playlist candidates, and artist updates — those are
+    /// deferred to `finalize` so they only run once per refresh. The
+    /// resulting save fires `@Query` observers, which is the whole point:
+    /// the UI fills in as artists complete instead of waiting for the
+    /// task group to drain.
+    func applyBatch(
+        fetchedReleases: [FetchedRelease],
+        now: Date,
+        markHistoricalAsSeen: Bool = false
+    ) -> BatchOutput {
+        var output = BatchOutput()
+        // Same hard recency gate as `apply` — see the comment there.
+        let fetchedReleases = ReleaseRecencyGate.filter(fetchedReleases, now: now)
+        guard !fetchedReleases.isEmpty else { return output }
+
+        do {
+            let fetchedIDs = Set(fetchedReleases.map(\.providerID))
+            let existingDescriptor = FetchDescriptor<ReleaseData>(
+                predicate: #Predicate { fetchedIDs.contains($0.providerID) }
+            )
+            let allExisting = try modelContext.fetch(existingDescriptor)
+            var existingByID = Dictionary(
+                allExisting.map { ($0.providerID, $0) },
+                uniquingKeysWith: { lhs, rhs in
+                    lhs.lastUpdatedAt >= rhs.lastUpdatedAt ? lhs : rhs
+                }
+            )
+
+            let historicalCutoffDays = 60
+            let cutoff = Calendar.current.date(
+                byAdding: .day,
+                value: -historicalCutoffDays,
+                to: Calendar.current.startOfDay(for: now)
+            )
+
+            for fetched in fetchedReleases {
+                if let existing = existingByID[fetched.providerID] {
+                    let releaseDateChanged = existing.releaseDate != fetched.releaseDate
+                    var changed = false
+
+                    if existing.artistProviderID != fetched.artistProviderID { existing.artistProviderID = fetched.artistProviderID; changed = true }
+                    if existing.artistName != fetched.artistName { existing.artistName = fetched.artistName; changed = true }
+                    if existing.title != fetched.title { existing.title = fetched.title; changed = true }
+                    if releaseDateChanged { existing.releaseDate = fetched.releaseDate; changed = true }
+                    if existing.artworkURL != fetched.artworkURL { existing.artworkURL = fetched.artworkURL; changed = true }
+                    if existing.albumURL != fetched.albumURL { existing.albumURL = fetched.albumURL; changed = true }
+                    if existing.provider != fetched.provider { existing.provider = fetched.provider; changed = true }
+                    if existing.type != fetched.type { existing.type = fetched.type; changed = true }
+
+                    if changed {
+                        existing.lastUpdatedAt = now
+                        output.updatedReleaseCount += 1
+                    }
+                    if releaseDateChanged {
+                        output.dateChangedIDs.append(existing.providerID)
+                    }
+                } else {
+                    let new = ReleaseData(
+                        providerID: fetched.providerID,
+                        artistProviderID: fetched.artistProviderID,
+                        artistName: fetched.artistName,
+                        title: fetched.title,
+                        releaseDate: fetched.releaseDate,
+                        artworkURL: fetched.artworkURL,
+                        albumURL: fetched.albumURL,
+                        provider: fetched.provider,
+                        type: fetched.type
+                    )
+                    if markHistoricalAsSeen,
+                       let rd = fetched.releaseDate,
+                       let cutoff,
+                       Calendar.current.startOfDay(for: rd) < cutoff {
+                        new.isSeen = true
+                    }
+                    modelContext.insert(new)
+                    existingByID[fetched.providerID] = new
+                    output.newReleaseIDs.append(new.providerID)
+                    output.newReleaseCount += 1
+                }
+            }
+
+            try modelContext.save()
+        } catch {
+            output.storageFailure = error.localizedDescription
+        }
+
+        return output
+    }
+
+    struct FinalizeOutput: Sendable {
+        var summarySpecs: [ReleaseSummarySpec] = []
+        var upcomingSpecs: [ReleaseNotificationSpec] = []
+        var playlistCandidates: [PlaylistSyncCandidate] = []
+        var widgetSnapshot: WidgetSnapshot = WidgetSnapshot(generatedAt: Date(), releases: [])
+        var widgetRequests: [WidgetArtworkRequest] = []
+        var storageFailure: String?
+    }
+
+    /// End-of-refresh pass. Pulls just the rows the streaming batches
+    /// inserted/updated, builds notification specs + widget snapshot +
+    /// playlist candidates, applies tracked-artist metadata writes, then
+    /// saves once. Fires `@Query` exactly one more time.
+    func finalize(
+        newReleaseIDs: [String],
+        dateChangedIDs: [String],
+        now: Date,
+        sameDaySummaryEnabled: Bool,
+        upcomingEnabled: Bool,
+        context: PerArtistContext,
+        artistUpdates: ArtistUpdates
+    ) -> FinalizeOutput {
+        var output = FinalizeOutput()
+
+        do {
+            let newIDSet = Set(newReleaseIDs)
+            let dateChangedIDSet = Set(dateChangedIDs)
+            let touchedIDs = newIDSet.union(dateChangedIDSet)
+            let newReleases: [ReleaseData]
+            let dateChangedReleases: [ReleaseData]
+            if !touchedIDs.isEmpty {
+                let descriptor = FetchDescriptor<ReleaseData>(
+                    predicate: #Predicate { touchedIDs.contains($0.providerID) }
+                )
+                let touched = (try? modelContext.fetch(descriptor)) ?? []
+                newReleases = touched.filter { newIDSet.contains($0.providerID) }
+                dateChangedReleases = touched.filter { dateChangedIDSet.contains($0.providerID) }
+            } else {
+                newReleases = []
+                dateChangedReleases = []
+            }
+
+            if sameDaySummaryEnabled {
+                let todayReleases = newReleases.filter { release in
+                    guard release.notifiedAt == nil, let releaseDate = release.releaseDate else { return false }
+                    guard Self.shouldNotify(
+                        type: release.type,
+                        artistPreference: context.preferenceByArtist[release.artistProviderID] ?? .inherit,
+                        globalPreference: context.globalPreference
+                    ) else { return false }
+                    return Calendar.current.isDateInToday(releaseDate) || releaseDate < Date()
+                }
+                output.summarySpecs = todayReleases.map(ReleaseSummarySpec.init(from:))
+                todayReleases.forEach { $0.notifiedAt = now }
+            }
+
+            if upcomingEnabled {
+                let upcomingToSchedule = (newReleases + dateChangedReleases).filter { release in
+                    guard let releaseDate = release.releaseDate, releaseDate > Date() else { return false }
+                    guard release.notifiedAt == nil || dateChangedIDSet.contains(release.providerID) else { return false }
+                    guard Self.shouldNotify(
+                        type: release.type,
+                        artistPreference: context.preferenceByArtist[release.artistProviderID] ?? .inherit,
+                        globalPreference: context.globalPreference
+                    ) else { return false }
+                    return true
+                }
+                output.upcomingSpecs = upcomingToSchedule.compactMap(ReleaseNotificationSpec.init(from:))
+                upcomingToSchedule.forEach { $0.notifiedAt = now }
+            }
+
+            output.playlistCandidates = newReleases
+                .filter { MusicProvider.fromStoredName($0.provider) == .appleMusic && !$0.providerID.isEmpty }
+                .map { release in
+                    PlaylistSyncCandidate(
+                        albumProviderID: release.providerID,
+                        kind: release.type,
+                        artistGenres: context.genresByArtist[release.artistProviderID] ?? []
+                    )
+                }
+
+            let trackedIDs = Set(artistUpdates.trackedProviderIDs)
+            let descriptor = FetchDescriptor<ArtistData>(
+                predicate: #Predicate { trackedIDs.contains($0.providerID) }
+            )
+            if let artists = try? modelContext.fetch(descriptor) {
+                for artist in artists {
+                    if let catalogID = artistUpdates.resolvedCatalogIDs[artist.providerID] {
+                        artist.catalogArtistID = catalogID
+                    }
+                    if let artwork = artistUpdates.resolvedArtworkURLs[artist.providerID] {
+                        artist.artworkURL = artwork
+                    }
+                    artist.lastCheckedAt = now
+                }
+            }
+
+            try modelContext.save()
+
+            let widgetCutoff = Calendar.current.date(byAdding: .day, value: -60, to: now) ?? now
+            let widgetDescriptor = FetchDescriptor<ReleaseData>(
+                predicate: #Predicate { release in
+                    release.dismissedAt == nil &&
+                    (release.releaseDate == nil || release.releaseDate! >= widgetCutoff)
+                }
+            )
+            let widgetReleases = (try? modelContext.fetch(widgetDescriptor)) ?? []
             let (snapshot, requests) = WidgetSnapshotWriter.captureSnapshot(from: widgetReleases)
             output.widgetSnapshot = snapshot
             output.widgetRequests = requests

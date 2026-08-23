@@ -63,11 +63,9 @@ struct ArtistFetchOutcome: Sendable {
 struct AppleMusicReleaseService {
     /// Hard cap per artist so a prolific catalogue can't blow the time budget.
     private let albumsPerArtist = 24
-    /// REST primary is the safety-net "what did Apple drop recently" call.
-    /// 12 newest entries is plenty for catching last-week singles without
-    /// dragging years of back-catalog into every refresh.
-    private let restPrimaryLimit = 12
-    private let restPrimaryRecentDays = 60
+    /// Every release path in this service is clamped to the same window —
+    /// see `ReleaseRecencyGate`.
+    private var recencyWindowDays: Int { ReleaseRecencyGate.windowDays }
 
     /// Pre-resolve a batch of cached catalog IDs in a single network request.
     /// Returns a map of catalog ID → Artist for the IDs that resolved.
@@ -105,12 +103,7 @@ struct AppleMusicReleaseService {
     func fetchOne(
         _ input: ArtistFetchInput,
         preResolvedArtist: Artist? = nil,
-        storefront: String? = nil,
-        // Incremental refresh window. When non-nil, the primary REST fetch
-        // only returns albums released within the last `daysSinceLastRefresh
-        // + 3` days (3-day buffer for late-arriving catalog updates). A
-        // first-ever refresh passes nil and gets the full default window.
-        daysSinceLastRefresh: Int? = nil
+        storefront: String? = nil
     ) async -> ArtistFetchOutcome {
         if input.kind == "label" {
             return await fetchLabelReleases(input)
@@ -145,15 +138,16 @@ struct AppleMusicReleaseService {
             //               `.with([.albums])` — now REST since it's faster
             //               and already date-sorted). The previous "restRecent"
             //               safety-net path is redundant under REST primary.
-            // - appearsOn:  REST appears-on, last 180 days
-            // Incremental window: clamp the primary fetch to the period since
-            // last refresh + a small buffer. Nil = first refresh = full window.
-            let primaryWindowDays: Int? = daysSinceLastRefresh.map { max(7, $0 + 3) }
+            // - appearsOn:  REST appears-on, same window
+            // Both paths use the fixed recency window — a refresh never
+            // imports anything older than a week, regardless of how long it
+            // has been since the last one.
+            let windowDays = recencyWindowDays
             async let primaryResult = self.fetchPrimaryAlbumsResult(
                 catalogArtist: catalogArtist,
                 artistProviderID: artistProviderID,
                 storefront: resolvedStorefront,
-                onlyWithinDays: primaryWindowDays
+                onlyWithinDays: windowDays
             )
             async let appearsOnResult: Result<[FetchedRelease], Error> = {
                 do {
@@ -161,7 +155,7 @@ struct AppleMusicReleaseService {
                         catalogArtistID: catalogID,
                         artistProviderID: artistProviderID,
                         storefront: resolvedStorefront,
-                        onlyWithinDays: 180
+                        onlyWithinDays: windowDays
                     )
                     return .success(result)
                 } catch {
@@ -188,7 +182,7 @@ struct AppleMusicReleaseService {
         } catch {
             let nsError = error as NSError
             let detail = "\(error.localizedDescription) [\(nsError.domain) \(nsError.code)]"
-            print("fetchOne failed for \(input.name): \(error) — full: \(String(reflecting: error))")
+            Log.v("fetchOne failed for \(input.name): \(error) — full: \(String(reflecting: error))")
             return ArtistFetchOutcome(
                 input: input, releases: [], catalogArtistID: nil,
                 artworkURL: nil, errorMessage: detail,
@@ -225,7 +219,7 @@ struct AppleMusicReleaseService {
         } catch {
             let nsError = error as NSError
             let detail = "\(error.localizedDescription) [\(nsError.domain) \(nsError.code)]"
-            print("fetchLabelReleases failed for \(input.name): \(String(reflecting: error))")
+            Log.v("fetchLabelReleases failed for \(input.name): \(String(reflecting: error))")
             return ArtistFetchOutcome(input: input, releases: [], catalogArtistID: nil, artworkURL: nil, errorMessage: detail)
         }
     }
@@ -313,98 +307,6 @@ struct AppleMusicReleaseService {
         )
     }
 
-    /// Per-fetch-path diagnostic. Hits MusicKit's `.albums`, REST primary
-    /// sorted-by-date, and REST appears-on for a single artist and returns a
-    /// human-readable report listing the most recent releases each path saw.
-    /// Lets users tell us "yesterday's single shows up in path X but not Y"
-    /// when something is missing from the feed.
-    func diagnoseArtistFetch(for input: ArtistFetchInput) async -> String {
-        var report = "Artist: \(input.name)\n"
-        report += "providerID: \(input.providerID)\n"
-        if let cached = input.catalogArtistID { report += "cached catalogArtistID: \(cached)\n" }
-        let storefront = (await currentStorefrontCountryCode()) ?? "us"
-        report += "storefront: \(storefront)\n\n"
-
-        let catalogArtist: Artist?
-        do {
-            catalogArtist = try await resolveCatalogArtist(for: input)
-        } catch {
-            return report + "FAILED to resolve catalog artist: \(error)"
-        }
-        guard let catalogArtist else {
-            return report + "No catalog artist match for \"\(input.name)\""
-        }
-        report += "resolved: \(catalogArtist.name) [\(catalogArtist.id.rawValue)]\n\n"
-
-        // Path 1: MusicKit .albums relationship
-        report += "─ MusicKit .albums ─\n"
-        do {
-            let detailed = try await catalogArtist.with([.albums])
-            let albums = detailed.albums.map(Array.init) ?? []
-            report += "count: \(albums.count)\n"
-            for a in albums.prefix(15) {
-                let date = a.releaseDate?.formatted(date: .abbreviated, time: .omitted) ?? "no-date"
-                report += "  • [\(date)] \(a.title)\n"
-            }
-        } catch {
-            report += "ERROR: \(error)\n"
-        }
-
-        // Path 2: REST primary, sorted by date desc
-        report += "\n─ REST primary (sort=-releaseDate) ─\n"
-        do {
-            let rest = try await fetchAlbumsViaREST(catalogArtistID: catalogArtist.id.rawValue, artistProviderID: input.providerID)
-            report += "count: \(rest.count)\n"
-            for r in rest.prefix(15) {
-                let date = r.releaseDate?.formatted(date: .abbreviated, time: .omitted) ?? "no-date"
-                report += "  • [\(date)] \(r.title)\n"
-            }
-        } catch {
-            report += "ERROR: \(error)\n"
-        }
-
-        // Path 3: REST appears-on
-        report += "\n─ REST appears-on (≤180d) ─\n"
-        do {
-            let app = try await fetchAppearsOnAlbumsViaREST(
-                catalogArtistID: catalogArtist.id.rawValue,
-                artistProviderID: input.providerID,
-                storefront: storefront,
-                onlyWithinDays: 180
-            )
-            report += "count: \(app.count)\n"
-            for r in app.prefix(15) {
-                let date = r.releaseDate?.formatted(date: .abbreviated, time: .omitted) ?? "no-date"
-                report += "  • [\(date)] \(r.title) — \(r.artistName)\n"
-            }
-        } catch {
-            report += "ERROR: \(error)\n"
-        }
-
-        return report
-    }
-
-    func fetchDiagnosticRelease(for artistName: String) async -> String {
-        do {
-            var request = MusicCatalogSearchRequest(term: artistName, types: [Artist.self])
-            request.limit = 1
-
-            let response = try await request.response()
-            if let artist = response.artists.first {
-                let detailed = try await artist.with([.albums])
-                let firstAlbum = detailed.albums?.first
-                if let firstAlbum {
-                    return "MusicKit OK. Artist \(artist.name) — first album: \(firstAlbum.title)."
-                }
-                return "MusicKit OK. Found artist \(artist.name) but no albums returned."
-            } else {
-                return "MusicKit search worked, but returned no artist for \(artistName)."
-            }
-        } catch {
-            return "MusicKit search failed for \(artistName): \(error.localizedDescription). Debug: \(String(describing: error))"
-        }
-    }
-
     // MARK: - Private
 
     private func resolveCatalogArtist(for artist: ArtistFetchInput) async throws -> Artist? {
@@ -434,6 +336,10 @@ struct AppleMusicReleaseService {
         name.compare(target, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
     }
 
+    /// Maps MusicKit `Album`s (relationship fallback + label `latestReleases`)
+    /// into `FetchedRelease`. Neither of those endpoints takes a date filter,
+    /// so the recency window is applied here — this used to let a year of back
+    /// catalog through whenever the REST primary path failed or came back empty.
     private func mapAlbums(_ albums: [Album], artistProviderID: String) -> [FetchedRelease] {
         albums.compactMap { album in
             // Skip promotional / placeholder catalog rows MusicKit occasionally
@@ -445,10 +351,7 @@ struct AppleMusicReleaseService {
             guard !rawID.isEmpty else { return nil }
 
             let releaseDate = album.releaseDate
-            if let releaseDate {
-                let daysFromRelease = Calendar.current.dateComponents([.day], from: releaseDate, to: Date()).day ?? 0
-                if releaseDate < Date() && daysFromRelease > 365 { return nil }
-            }
+            guard ReleaseRecencyGate.isWithinWindow(releaseDate) else { return nil }
 
             return FetchedRelease(
                 providerID: rawID,
@@ -535,6 +438,8 @@ struct AppleMusicReleaseService {
         limit: Int? = nil,
         onlyWithinDays: Int? = nil
     ) async throws -> [FetchedRelease] {
+        // Never wider than the recency window, even if a caller asks for more.
+        let windowDays = min(onlyWithinDays ?? recencyWindowDays, recencyWindowDays)
         let resolvedStorefront: String
         if let storefront {
             resolvedStorefront = storefront
@@ -552,22 +457,22 @@ struct AppleMusicReleaseService {
         }
         let page = try sharedRESTDecoder.decode(RESTAlbumPage.self, from: response.data)
 
-        // Recent-only cutoff for the always-on REST primary path. Past
-        // releases older than `onlyWithinDays` are dropped so a refresh
-        // doesn't keep dragging the entire back catalog into the feed.
-        // Future-dated rows pass regardless (so upcoming drops still surface).
-        let recentCutoff = onlyWithinDays.flatMap {
-            Calendar.current.date(byAdding: .day, value: -$0, to: Date())
-        }
+        // Recent-only cutoff for the always-on REST primary path. `sort=
+        // -releaseDate` puts the newest first, so everything past the cutoff
+        // is back catalog we don't want in the feed. Future-dated rows pass
+        // regardless (so upcoming drops still surface); undated rows can't be
+        // shown to be recent, so they're dropped.
+        let now = Date()
+        let recentCutoff = Calendar.current.date(
+            byAdding: .day,
+            value: -windowDays,
+            to: Calendar.current.startOfDay(for: now)
+        )
 
         return page.data.compactMap { item -> FetchedRelease? in
             guard let attrs = item.attributes, let title = attrs.name else { return nil }
-            let releaseDate = attrs.parsedReleaseDate
-            if let releaseDate {
-                let daysFromRelease = Calendar.current.dateComponents([.day], from: releaseDate, to: Date()).day ?? 0
-                if releaseDate < Date() && daysFromRelease > 365 { return nil }
-                if let cutoff = recentCutoff, releaseDate < cutoff { return nil }
-            }
+            guard let releaseDate = attrs.parsedReleaseDate else { return nil }
+            if releaseDate <= now, let cutoff = recentCutoff, releaseDate < cutoff { return nil }
             let artworkURL = attrs.artwork?.templatedURL(width: 600, height: 600)
             let albumURL = attrs.url.flatMap { URL(string: $0) }
             return FetchedRelease(
@@ -596,23 +501,56 @@ struct AppleMusicReleaseService {
         storefront: String,
         onlyWithinDays: Int
     ) async throws -> [FetchedRelease] {
+        // 404 cache: most tracked artists have no appears-on data, and Apple
+        // returns 404 for them. The MusicKit framework also internally retries
+        // those once before surfacing the error, doubling wasted requests and
+        // contributing to the 429 bursts we'd otherwise see. Cache the 404
+        // verdict per artist for 30 days so we skip the network entirely.
+        if Self.isAppearsOn404Cached(catalogArtistID: catalogArtistID) {
+            return []
+        }
+
         let path = "/v1/catalog/\(storefront)/artists/\(catalogArtistID)/view/appears-on-albums?limit=\(albumsPerArtist)"
         guard let url = URL(string: "https://api.music.apple.com" + path) else { return [] }
         let dataRequest = MusicDataRequest(urlRequest: URLRequest(url: url))
-        let response = try await dataRequest.response()
+        let response: MusicDataResponse
+        do {
+            response = try await dataRequest.response()
+        } catch {
+            // Apple returns 404 ("No related resources") for artists who
+            // genuinely have no appears-on data. Treat that as an empty list
+            // and cache the verdict so we don't ask again for a month.
+            if Self.is404(error) {
+                Self.cacheAppearsOn404(catalogArtistID: catalogArtistID)
+                return []
+            }
+            throw error
+        }
         if response.urlResponse.statusCode == 429 {
             throw AppleAPIError.rateLimited
         }
+        if response.urlResponse.statusCode == 404 {
+            Self.cacheAppearsOn404(catalogArtistID: catalogArtistID)
+            return []
+        }
         let page = try sharedRESTDecoder.decode(RESTAlbumPage.self, from: response.data)
 
-        let cutoff = Calendar.current.date(byAdding: .day, value: -onlyWithinDays, to: Date())
+        // Never wider than the recency window, even if a caller asks for more.
+        let windowDays = min(onlyWithinDays, recencyWindowDays)
+        let now = Date()
+        let cutoff = Calendar.current.date(
+            byAdding: .day,
+            value: -windowDays,
+            to: Calendar.current.startOfDay(for: now)
+        )
 
         return page.data.compactMap { item -> FetchedRelease? in
             guard let attrs = item.attributes, let title = attrs.name else { return nil }
-            let releaseDate = attrs.parsedReleaseDate
             // Drop anything older than the cutoff (only need recent features).
-            // Future-dated feature spots are kept regardless.
-            if let releaseDate, let cutoff, releaseDate < cutoff { return nil }
+            // Future-dated feature spots are kept regardless; undated ones are
+            // dropped since we can't show them to be recent.
+            guard let releaseDate = attrs.parsedReleaseDate else { return nil }
+            if releaseDate <= now, let cutoff, releaseDate < cutoff { return nil }
             let artworkURL = attrs.artwork?.templatedURL(width: 600, height: 600)
             let albumURL = attrs.url.flatMap { URL(string: $0) }
             return FetchedRelease(
@@ -635,9 +573,24 @@ struct AppleMusicReleaseService {
         (await currentStorefrontCountryCode()) ?? "us"
     }
 
+    private static let storefrontCacheKey = "cachedStorefrontCountryCode"
+    private static let storefrontCacheTimestampKey = "cachedStorefrontCountryCodeAt"
+    private static let storefrontCacheTTL: TimeInterval = 7 * 24 * 60 * 60
+
     private func currentStorefrontCountryCode() async -> String? {
+        let defaults = UserDefaults.standard
+        let cachedAt = defaults.double(forKey: Self.storefrontCacheTimestampKey)
+        if cachedAt > 0,
+           Date().timeIntervalSince1970 - cachedAt < Self.storefrontCacheTTL,
+           let cached = defaults.string(forKey: Self.storefrontCacheKey),
+           !cached.isEmpty {
+            return cached
+        }
         do {
-            return try await MusicDataRequest.currentCountryCode
+            let code = try await MusicDataRequest.currentCountryCode
+            defaults.set(code, forKey: Self.storefrontCacheKey)
+            defaults.set(Date().timeIntervalSince1970, forKey: Self.storefrontCacheTimestampKey)
+            return code
         } catch {
             return Locale.current.region?.identifier
         }
@@ -699,7 +652,12 @@ struct AppleMusicReleaseService {
 
     private func withRetry<T>(_ operation: @escaping () async throws -> T) async throws -> T {
         var lastError: Error?
-        let maxAttempts = 5
+        // 3 attempts is plenty: more aggressive retries just compound the
+        // rate-limit pain because each backoff blocks the slot the
+        // coordinator's AIMD cap is already trying to free. Better to
+        // fail fast and let the higher-level concurrency controller
+        // throttle accordingly.
+        let maxAttempts = 3
 
         for attempt in 0..<maxAttempts {
             do {
@@ -708,21 +666,67 @@ struct AppleMusicReleaseService {
                 lastError = error
                 if Task.isCancelled { throw error }
 
-                // Only back off hard for confirmed rate-limit signals. The old
-                // path string-matched decode-failure-on-non-JSON, which made a
-                // single malformed Apple response stall the artist for 40+s.
-                // Now we trust `AppleAPIError.rateLimited` (set when the REST
-                // helper sees an HTTP 429), and fall back to the historical
-                // text markers only as a safety net for the MusicKit-typed
-                // throw paths we can't inspect status on.
+                // Backoff tuned for fast-failure. Old path waited up to
+                // 46.5s per call on rate-limit retries, which was the
+                // dominant cause of refreshes spending minutes per
+                // batch. The AIMD cap in the coordinator already halves
+                // concurrency on a 429 — that's the right place to
+                // throttle, not here.
                 let isRateLimited = Self.looksLikeRateLimit(error)
-                let baseMs: UInt64 = isRateLimited ? 1500 : 250
-                let delayMs = baseMs * UInt64(1 << attempt) // exponential: 1.5s,3s,6s,12s,24s
+                let baseMs: UInt64 = isRateLimited ? 600 : 200
+                let delayMs = baseMs * UInt64(1 << attempt) // 0.6/1.2/2.4 or 0.2/0.4/0.8
                 try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
             }
         }
 
         throw lastError ?? CancellationError()
+    }
+
+    // MARK: - Appears-on 404 cache
+
+    private static let appearsOn404CacheKey = "appearsOn404ArtistIDs"
+    private static let appearsOn404CacheTimestampKey = "appearsOn404ArtistIDsCachedAt"
+    private static let appearsOn404CacheTTL: TimeInterval = 30 * 24 * 60 * 60
+
+    private static func cachedAppearsOn404Set() -> Set<String> {
+        let defaults = UserDefaults.standard
+        let cachedAt = defaults.double(forKey: appearsOn404CacheTimestampKey)
+        // TTL expired → drop the whole set so we re-discover any artists who
+        // may have picked up new feature credits since the last sweep.
+        if cachedAt == 0 || Date().timeIntervalSince1970 - cachedAt > appearsOn404CacheTTL {
+            defaults.removeObject(forKey: appearsOn404CacheKey)
+            defaults.removeObject(forKey: appearsOn404CacheTimestampKey)
+            return []
+        }
+        let array = defaults.stringArray(forKey: appearsOn404CacheKey) ?? []
+        return Set(array)
+    }
+
+    private static func isAppearsOn404Cached(catalogArtistID: String) -> Bool {
+        cachedAppearsOn404Set().contains(catalogArtistID)
+    }
+
+    private static func cacheAppearsOn404(catalogArtistID: String) {
+        var set = cachedAppearsOn404Set()
+        guard !set.contains(catalogArtistID) else { return }
+        set.insert(catalogArtistID)
+        let defaults = UserDefaults.standard
+        defaults.set(Array(set), forKey: appearsOn404CacheKey)
+        // Only stamp the timestamp on the first insertion of a window so the
+        // TTL counts from when we started populating, not from each insert.
+        if defaults.double(forKey: appearsOn404CacheTimestampKey) == 0 {
+            defaults.set(Date().timeIntervalSince1970, forKey: appearsOn404CacheTimestampKey)
+        }
+    }
+
+    /// Detect a 404 from either a typed `MusicDataRequest.Error` or its
+    /// reflected description (different framework versions wrap the status
+    /// differently).
+    private static func is404(_ error: Error) -> Bool {
+        let description = String(reflecting: error)
+        return description.contains("status: 404")
+            || description.contains("statusCode = 404")
+            || description.contains(" 404 ")
     }
 
     private static func looksLikeRateLimit(_ error: Error) -> Bool {

@@ -43,7 +43,12 @@ struct AlbumView: View {
     @Environment(\.modelContext) private var modelContext
     @AppStorage(AppSettings.lastFMAPIKey) private var lastFMAPIKey = AppSettings.defaultLastFMAPIKey
     @Query private var allArtists: [ArtistData]
-    @StateObject private var previewPlayer = AlbumPreviewPlayer()
+    /// Shared with ContentView so playback survives leaving this view —
+    /// the global mini-player at the app root keeps reading the same
+    /// player instance. Previously this was a `@StateObject` owned by
+    /// AlbumView, which meant pushing away tore down both the bar and
+    /// the queue.
+    @EnvironmentObject private var previewPlayer: AlbumPreviewPlayer
     @State private var lastFMInfo: LastFMAlbumInfo?
     @State private var lastFMError: String?
     @State private var tracks: [AlbumTrackRow] = []
@@ -57,6 +62,9 @@ struct AlbumView: View {
     @State private var playlistAddMessage: String?
     @State private var calendarMessage: String?
     @State private var showingCalendarAlert = false
+    /// Mirrors `previewPlayer.errorMessage` so the alert survives the player
+    /// resetting its own state while the alert is still on screen.
+    @State private var playbackErrorMessage: String?
     /// Non-nil while the user is dragging the mini-player progress bar.
     /// Captures the target fraction so the bar tracks the finger live.
     @State private var scrubFraction: Double?
@@ -65,7 +73,6 @@ struct AlbumView: View {
     /// moves the play head by the drag distance, not by the touch location.
     @State private var scrubStartFraction: Double?
     @State private var showingArtworkFullscreen = false
-    @State private var artistPushTarget: ArtistData?
     @State private var addedSongIDs: Set<String> = []
     @State private var addingSongIDs: Set<String> = []
     /// Tracks the user added in this view session. Drives the brief plus → check
@@ -145,41 +152,57 @@ struct AlbumView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 18) {
-                centeredHero
-                centeredStats
-                centeredActions
-                tagsRow
-                if !tracks.isEmpty {
-                    tracklistSection
-                } else if !tracksLoadAttempted {
-                    tracklistSkeleton
+        // The GeometryReader sits *outside* `.ignoresSafeArea` purely to read
+        // the real top inset. The scroll view then bleeds into that strip so
+        // the backdrop runs under the status bar, and the content pays the
+        // inset back as padding — which keeps the cover correctly placed on
+        // every device instead of hard-coding a Dynamic Island's worth of
+        // space. Without this the album page opened on the same flat white
+        // strip the Feed had.
+        GeometryReader { proxy in
+            ScrollView {
+                VStack(spacing: 18) {
+                    centeredHero
+                    centeredStats
+                    centeredActions
+                    tagsRow
+                    if !tracks.isEmpty {
+                        tracklistSection
+                    } else if !tracksLoadAttempted {
+                        tracklistSkeleton
+                    }
+                    Spacer(minLength: 0)
                 }
-                Spacer(minLength: 0)
+                .padding(.horizontal, 20)
+                .padding(.top, proxy.safeAreaInsets.top + 8)
+                .padding(.bottom, 20)
+                // Backdrop is a background of the *scrolling content*, so it
+                // scrolls away with the hero rather than staying pinned
+                // behind the tracklist.
+                .background(alignment: .top) { artworkBackdrop }
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 8)
-            .padding(.bottom, 20)
+            .ignoresSafeArea(edges: .top)
         }
         .background(AppTheme.background.ignoresSafeArea())
         .tint(AppTheme.accent)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            release?.isSeen = true
-            try? modelContext.save()
-        }
-        .onDisappear {
-            previewPlayer.stop()
-        }
-        .safeAreaInset(edge: .bottom) {
-            if previewPlayer.isActive {
-                miniPlayerBar
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            if let release {
+                release.isSeen = true
+                // Bump `lastUpdatedAt` so CloudKit treats this write as
+                // newer than any concurrent refresh touching the same
+                // row — otherwise the seen flag can silently revert
+                // after the next iCloud round-trip.
+                release.lastUpdatedAt = Date()
+                try? modelContext.save()
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: previewPlayer.isActive)
-        .navigationDestination(item: $artistPushTarget) { ArtistDetailView(artist: $0) }
+        // Mini-player now lives at the app root (ContentView) so playback
+        // and its UI persist across navigation. AlbumView no longer stops
+        // the player on disappear — the user dismisses it via the bar's
+        // own X button, or it ends naturally when the queue completes.
+        // No `navigationDestination` here — artist pushes resolve against the
+        // `for: ArtistData.self` destination registered at each stack root.
         .toolbar {
             if releaseProvider == .appleMusic, let providerID = release?.providerID {
                 // Standalone calendar button — only for strictly future releases.
@@ -194,6 +217,18 @@ struct AlbumView: View {
                                 .foregroundStyle(AppTheme.accent)
                         }
                         .accessibilityLabel("Add to Calendar")
+                    }
+                }
+                // Share sits to the LEFT of the `+` menu so the `+` keeps
+                // its rightmost-edge "primary action" placement. Only
+                // shown when we have an Apple Music album URL to share.
+                if let shareURL = release?.albumURL {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        ShareLink(item: shareURL) {
+                            Image(systemName: "square.and.arrow.up")
+                                .foregroundStyle(AppTheme.accent)
+                        }
+                        .accessibilityLabel("Share album")
                     }
                 }
                 // `+` menu for library / playlist adds.
@@ -231,6 +266,25 @@ struct AlbumView: View {
         } message: { msg in
             Text(msg)
         }
+        // Playback failures used to be written to the player's `.error` state
+        // and then dropped on the floor — tapping Play without an Apple Music
+        // subscription did nothing at all, with no explanation.
+        .alert(
+            "Can't Play",
+            isPresented: Binding(
+                get: { playbackErrorMessage != nil },
+                set: { if !$0 { playbackErrorMessage = nil; previewPlayer.clearError() } }
+            ),
+            presenting: playbackErrorMessage
+        ) { _ in
+            Button("OK", role: .cancel) {}
+        } message: { msg in
+            Text(msg)
+        }
+        .onChange(of: previewPlayer.errorMessage) { _, message in
+            guard let message else { return }
+            playbackErrorMessage = message
+        }
         .task {
             // Last.fm is independent — fan it out so it doesn't block tracks.
             // Library membership and popularity both read `tracks`, so they
@@ -244,6 +298,52 @@ struct AlbumView: View {
         }
         .tracksTabNavigationDepth()
     }
+
+    // MARK: - Backdrop
+
+    /// Full-bleed, heavily blurred copy of the cover filling the top of the
+    /// page — edge to edge and up under the status bar — fading out into the
+    /// page background before the tracklist starts.
+    ///
+    /// Previously the album page opened on a flat slab of `AppTheme.background`
+    /// with a rounded cover floating in the middle of it, so the top of the
+    /// screen carried none of the release's identity. Blurring hard (and
+    /// clipping, so the blur can't bleed past the fade) keeps every bit of
+    /// text drawn over it legible without a scrim.
+    @ViewBuilder
+    private var artworkBackdrop: some View {
+        if artworkURL != nil {
+            CachedAsyncImage(url: artworkURL) { Color.clear }
+                .aspectRatio(contentMode: .fill)
+                .frame(height: backdropHeight)
+                .frame(maxWidth: .infinity)
+                .clipped()
+                .blur(radius: 60, opaque: true)
+                .saturation(1.25)
+                .overlay {
+                    // Ramp to the page background so there is no seam where
+                    // the backdrop ends, and keep enough veil over the whole
+                    // thing that the title/stats stay readable on a busy or
+                    // light cover.
+                    LinearGradient(
+                        stops: [
+                            .init(color: AppTheme.background.opacity(0.12), location: 0),
+                            .init(color: AppTheme.background.opacity(0.42), location: 0.5),
+                            .init(color: AppTheme.background.opacity(0.88), location: 0.85),
+                            .init(color: AppTheme.background, location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+                .frame(height: backdropHeight)
+                .clipped()
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var backdropHeight: CGFloat { 560 }
 
     // MARK: - Hero (centered)
 
@@ -270,21 +370,30 @@ struct AlbumView: View {
                     .multilineTextAlignment(.center)
                     .lineLimit(3)
 
-                Button {
-                    navigateToArtist()
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(artistName)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(AppTheme.primaryText)
-                            .lineLimit(2)
-                            .multilineTextAlignment(.center)
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(AppTheme.secondary)
+                // Only a link when we can actually resolve a stored artist —
+                // the old Button rendered a chevron unconditionally and then
+                // silently did nothing when no match existed.
+                if let linkedArtist {
+                    NavigationLink(value: linkedArtist) {
+                        HStack(spacing: 4) {
+                            Text(artistName)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(AppTheme.primaryText)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.center)
+                            Image(systemName: "chevron.right")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(AppTheme.secondary)
+                        }
                     }
+                    .buttonStyle(.plain)
+                } else {
+                    Text(artistName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(AppTheme.primaryText)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
                 }
-                .buttonStyle(.plain)
 
                 HStack(spacing: 6) {
                     Text(formattedReleaseDate)
@@ -402,9 +511,29 @@ struct AlbumView: View {
         VStack(alignment: .leading, spacing: 12) {
             // Section title only — the big play button at the top of the page
             // owns the play action now.
-            Text("Tracks")
-                .font(.headline)
-                .foregroundStyle(AppTheme.primaryText)
+            HStack(spacing: 8) {
+                Text("Tracks")
+                    .font(.headline)
+                    .foregroundStyle(AppTheme.primaryText)
+
+                Spacer()
+
+                // Legend for the leading dot. Without it the red dots beside
+                // a few tracks are unexplained decoration — shown only when
+                // there's actually something to explain.
+                if tracks.contains(where: { popularTrackTitles.contains($0.title.lowercased()) }) {
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(AppTheme.accent)
+                            .frame(width: 6, height: 6)
+                        Text("Popular")
+                            .font(.caption)
+                            .foregroundStyle(AppTheme.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("A red dot marks the album's most popular tracks")
+                }
+            }
 
             let grouped = Dictionary(grouping: tracks, by: \.discNumber)
                 .sorted { $0.key < $1.key }
@@ -456,10 +585,14 @@ struct AlbumView: View {
         let isPopular = popularTrackTitles.contains(track.title.lowercased())
         return HStack(spacing: 8) {
             // Popularity dot — leftmost. Same reserved width whether visible or not
-            // so all track numbers below stay aligned.
+            // so all track numbers below stay aligned. Carries its meaning for
+            // VoiceOver, which otherwise reads the row with no hint that some
+            // tracks are marked at all.
             Circle()
                 .fill(isPopular ? AppTheme.accent : Color.clear)
                 .frame(width: 6, height: 6)
+                .accessibilityLabel(isPopular ? "Popular track" : "")
+                .accessibilityHidden(!isPopular)
 
             Group {
                 if isPlaying {
@@ -548,19 +681,22 @@ struct AlbumView: View {
         return String(format: "%d:%02d", total / 60, total % 60)
     }
 
-    /// Match the release's artist to a stored ArtistData and push their detail page.
+    /// The stored `ArtistData` this release's artist resolves to, if any.
     /// Falls back to a case/diacritic-insensitive name match when the providerID
     /// isn't on a tracked artist (e.g. compilation tracks crediting featured artists).
-    private func navigateToArtist() {
+    ///
+    /// Resolved at render time so the artist row can be a value-based
+    /// `NavigationLink`. It used to be a tap handler assigning to a
+    /// `navigationDestination(item:)` binding, which kept the artist page
+    /// presented while the item stayed non-nil — so pushing an album from that
+    /// artist page made SwiftUI re-push the artist page on top of the album.
+    private var linkedArtist: ArtistData? {
         if let providerID = release?.artistProviderID,
            let match = allArtists.first(where: { $0.providerID == providerID }) {
-            artistPushTarget = match
-            return
+            return match
         }
-        if let nameMatch = allArtists.first(where: {
+        return allArtists.first {
             $0.name.compare(artistName, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
-        }) {
-            artistPushTarget = nameMatch
         }
     }
 
@@ -588,6 +724,10 @@ struct AlbumView: View {
                 addedSongIDs.insert(track.id)
                 justAddedSongIDs.insert(track.id)
             }
+            // Fold the add into the shared index too, otherwise leaving and
+            // reopening the album shows a `+` again until the next full
+            // library refetch.
+            await LibraryMembershipIndex.shared.record(catalogSongIDs: [track.id])
             // Hold the checkmark briefly so the user gets a positive confirmation,
             // then fade to the transparent spacer so the row settles into its
             // resting "already in library" state.
@@ -681,11 +821,19 @@ struct AlbumView: View {
     private func loadLibraryMembership() async {
         guard releaseProvider == .appleMusic, !tracks.isEmpty else { return }
         #if os(iOS) || os(visionOS) || targetEnvironment(macCatalyst)
-        let index = await LibraryMembershipIndex.shared.get()
+        let snapshot = await LibraryMembershipIndex.shared.get()
         var found: Set<String> = []
         for track in tracks {
-            let effectiveArtist = (track.artistName.isEmpty ? artistName : track.artistName).lowercased()
-            if index[effectiveArtist]?.contains(track.title.lowercased()) == true {
+            // `track.id` is the catalog song ID, so this distinguishes the
+            // single from the album cut of the same recording. Only songs with
+            // no catalog identity fall back to artist + title inside
+            // `contains` — see LibraryMembershipSnapshot.
+            let effectiveArtist = track.artistName.isEmpty ? artistName : track.artistName
+            if snapshot.contains(
+                catalogSongID: track.id,
+                title: track.title,
+                artistName: effectiveArtist
+            ) {
                 found.insert(track.id)
             }
         }
@@ -850,6 +998,20 @@ struct AlbumView: View {
         do {
             try await previewPlayer.addToLibrary(albumProviderID: providerID)
             libraryAddState = .added
+            // The album add covers every track on it, so hide the per-row
+            // `+` buttons — leaving them around would imply the songs still
+            // need adding individually. Use the same `addedSongIDs` slot the
+            // initial library-membership scan populates so the row renderer
+            // collapses the trailing slot identically.
+            addedSongIDs.formUnion(tracks.map(\.id))
+            await LibraryMembershipIndex.shared.record(catalogSongIDs: tracks.map(\.id))
+            // Hold the ✓ briefly so the user sees the confirmation, then
+            // collapse back to `+` so the menu reads as actionable again
+            // (Add to Playlist… is still useful even after an album add).
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            if case .added = libraryAddState {
+                libraryAddState = .idle
+            }
         } catch {
             libraryAddState = .failed(error.localizedDescription)
         }

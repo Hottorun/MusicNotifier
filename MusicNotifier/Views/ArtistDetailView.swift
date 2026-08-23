@@ -9,6 +9,7 @@ import SwiftData
 struct ArtistDetailView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.openURL) private var openURL
+    @Environment(\.colorScheme) private var colorScheme
     @Bindable var artist: ArtistData
     @Query private var releases: [ReleaseData]
     @Query private var allArtists: [ArtistData]
@@ -16,7 +17,6 @@ struct ArtistDetailView: View {
     @State private var lastFMInfo: LastFMArtistInfo?
     @State private var lastFMError: String?
     @State private var showingBio = false
-    @State private var similarPushTarget: ArtistData?
     @State private var similarArtworkByName: [String: URL] = SimilarArtistArtworkCache.shared.snapshot()
 
     init(artist: ArtistData) {
@@ -71,17 +71,24 @@ struct ArtistDetailView: View {
                 }
                 supplementalContext
             }
-            .padding(.top, 8)
             .padding(.bottom, 32)
         }
-        // Empty nav title — the hero card displays the artist name in full.
+        // Lets the hero bleed into the status-bar strip instead of starting
+        // below it. Everything after the hero flows down from there, so no
+        // other section needs compensating padding.
+        .ignoresSafeArea(edges: .top)
+        // Empty nav title — the hero displays the artist name in full.
         // The back chevron alone is enough chrome at the top.
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .appScreenBackground()
-        .navigationDestination(for: ReleaseData.self) { release in
-            AlbumView(release: release)
-        }
+        // No `navigationDestination` of any kind here. Both `ReleaseData` and
+        // `ArtistData` destinations are registered once at the NavigationStack
+        // root (Home / Artists / Upcoming / the deep-link sheet). Registering
+        // a `for:` destination here made it fire at both depths; registering
+        // an `item:` one kept this page presented while its binding stayed
+        // non-nil, so it re-pushed above any album opened from it. Both
+        // produced the same "album opens, artist page reopens on top" symptom.
         .task {
             await loadLastFMInfo()
         }
@@ -89,53 +96,68 @@ struct ArtistDetailView: View {
             bioSheet
         }
         .onChange(of: artist.isTracked) { _, _ in try? modelContext.save() }
-        .navigationDestination(item: $similarPushTarget) { ArtistDetailView(artist: $0) }
         .tracksTabNavigationDepth()
     }
 
     // MARK: - Hero
 
-    /// Wide poster-style hero: the artist's artwork fills the full card,
-    /// a dark gradient brings text contrast at the bottom, and the name +
-    /// stats sit on top of the artwork itself. Replaces the previous
-    /// detached "circle on empty bg" composition, which read as a placeholder
-    /// rather than a hero. Nav title is hidden in `body` so the large name
-    /// here is the only one.
+    /// Height of the artwork itself, measured from the very top of the screen
+    /// (the hero runs under the status bar). The last `heroFadeFraction` of it
+    /// dissolves into the page background, and the name/stats sit inside that
+    /// dissolved band.
+    private var heroHeight: CGFloat { 420 }
+    private var heroFadeFraction: CGFloat { 0.42 }
+
+    /// Full-bleed hero: the artist photo *is* the top of the screen — edge to
+    /// edge, running up under the status bar — and melts into the page
+    /// background over its lower third instead of ending on a hard rounded
+    /// edge. Previously this was an inset rounded card floating on the page,
+    /// which read as a boxed thumbnail rather than a header.
+    ///
+    /// Because the bottom of the gradient resolves to `AppTheme.background`,
+    /// the name and stats sitting in that band are ordinary page text
+    /// (`primaryText` / `secondary`) — no white-on-artwork guesswork, and it
+    /// stays legible over light and dark photos in both appearances.
     private var hero: some View {
         ZStack(alignment: .bottomLeading) {
             CachedAsyncImage(url: artist.artworkURL) {
                 Rectangle().fill(AppTheme.elevatedSurface)
                     .overlay {
                         Image(systemName: "person.fill")
-                            .font(.system(size: 48, weight: .light))
+                            .font(.system(size: 64, weight: .light))
                             .foregroundStyle(AppTheme.secondary)
                     }
             }
             .aspectRatio(contentMode: .fill)
-            .frame(height: 280)
+            .frame(height: heroHeight)
             .frame(maxWidth: .infinity)
             .clipped()
 
-            // Heavy bottom gradient — keeps the text legible regardless of
-            // how light the artwork is. Top ~40% stays nearly transparent so
-            // the artwork still reads.
+            // Melt into the page. Fully transparent across the top so the
+            // photo reads, then ramps to the exact page background so there
+            // is no visible seam where the hero ends.
             LinearGradient(
-                colors: [
-                    .black.opacity(0),
-                    .black.opacity(0.35),
-                    .black.opacity(0.85)
+                stops: [
+                    .init(color: AppTheme.background.opacity(0), location: 1 - heroFadeFraction),
+                    .init(color: AppTheme.background.opacity(0.55), location: 1 - heroFadeFraction * 0.45),
+                    .init(color: AppTheme.background, location: 0.94)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
             )
 
-            VStack(alignment: .leading, spacing: 8) {
+            // Deliberately no top scrim. iOS picks the status-bar style by
+            // sampling what's actually rendered there, and it gets it right
+            // on both dark and near-white artwork; darkening the top only
+            // pushed mid-tone photos toward the middle, hurting the dark
+            // clock it had already chosen. The back button carries its own
+            // glass background for contrast.
+            VStack(alignment: .leading, spacing: 6) {
                 Text(artist.name)
-                    .font(.system(size: 30, weight: .heavy, design: .rounded))
-                    .foregroundStyle(.white)
+                    .font(.system(size: 32, weight: .heavy, design: .rounded))
+                    .foregroundStyle(AppTheme.primaryText)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
-                    .shadow(color: .black.opacity(0.5), radius: 8, y: 2)
 
                 HStack(spacing: 6) {
                     heroMetric("\(releases.count)", "releases")
@@ -151,29 +173,26 @@ struct ArtistDetailView: View {
                     }
                 }
                 .font(.footnote)
-                .foregroundStyle(.white.opacity(0.85))
+                .foregroundStyle(AppTheme.secondary)
             }
             .padding(.horizontal, 20)
-            .padding(.bottom, 18)
+            .padding(.bottom, 4)
         }
-        .frame(height: 280)
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(AppTheme.hairline, lineWidth: 1)
-        )
-        .padding(.horizontal, 16)
+        .frame(height: heroHeight)
+        .clipped()
     }
 
+    // The metrics now sit in the hero's faded band — i.e. on the page
+    // background — so they use the normal text palette rather than white.
     private func heroMetric(_ value: String, _ label: String) -> some View {
         HStack(spacing: 4) {
-            Text(value).foregroundStyle(.white).fontWeight(.bold)
-            Text(label).foregroundStyle(.white.opacity(0.75))
+            Text(value).foregroundStyle(AppTheme.primaryText).fontWeight(.bold)
+            Text(label).foregroundStyle(AppTheme.secondary)
         }
     }
 
     private var heroDot: some View {
-        Circle().fill(.white.opacity(0.5)).frame(width: 3, height: 3)
+        Circle().fill(AppTheme.secondary.opacity(0.6)).frame(width: 3, height: 3)
     }
 
     // MARK: - Quick actions
@@ -212,12 +231,15 @@ struct ArtistDetailView: View {
         } label: {
             HStack(spacing: 12) {
                 ZStack {
+                    // Same accent-on-accentSoft treatment as the Artists list
+                    // bell. `.white` on `elevatedSurface` rendered the
+                    // "Following" checkmark invisible in light mode.
                     Circle()
-                        .fill(AppTheme.elevatedSurface)
+                        .fill(artist.isTracked ? AppTheme.accentSoft : AppTheme.elevatedSurface)
                         .frame(width: 36, height: 36)
                     Image(systemName: artist.isTracked ? "checkmark" : "plus")
                         .font(.subheadline.weight(.bold))
-                        .foregroundStyle(artist.isTracked ? .white : AppTheme.secondary)
+                        .foregroundStyle(artist.isTracked ? AppTheme.accent : AppTheme.secondary)
                 }
 
                 Text(artist.isTracked ? "Following" : "Follow")
@@ -250,7 +272,9 @@ struct ArtistDetailView: View {
                 }
                 Text(bio)
                     .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.85))
+                    // Was `.white.opacity(0.85)` — invisible on the light
+                    // `surface` card, which made the About block look empty.
+                    .foregroundStyle(AppTheme.primaryText.opacity(0.85))
                     .lineLimit(3)
                     .multilineTextAlignment(.leading)
             }
@@ -285,12 +309,24 @@ struct ArtistDetailView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(alignment: .top, spacing: 14) {
                     ForEach(names.prefix(12), id: \.self) { name in
-                        Button {
-                            handleSimilarArtistTap(name)
-                        } label: {
-                            similarArtistCard(name: name)
+                        // Locally-tracked artists push via a value-based link;
+                        // everyone else opens Apple Music. This was one Button
+                        // assigning to a `navigationDestination(item:)`
+                        // binding, which re-pushed this page on top of any
+                        // album opened from the artist it navigated to.
+                        if let local = localArtist(named: name) {
+                            NavigationLink(value: local) {
+                                similarArtistCard(name: name)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            Button {
+                                openInAppleMusic(name)
+                            } label: {
+                                similarArtistCard(name: name)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
                 .padding(.horizontal, 2)
@@ -353,13 +389,16 @@ struct ArtistDetailView: View {
         }
     }
 
-    /// Tap a similar artist: navigate to their detail page if we already track
-    /// them locally, otherwise open the artist in Apple Music for browsing.
-    private func handleSimilarArtistTap(_ name: String) {
-        if let local = allArtists.first(where: { $0.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }) {
-            similarPushTarget = local
-            return
+    /// The stored artist matching a Last.fm similar-artist name, if we track
+    /// them. Drives whether the card is a push link or an Apple Music link.
+    private func localArtist(named name: String) -> ArtistData? {
+        allArtists.first {
+            $0.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
         }
+    }
+
+    /// Fallback for similar artists we don't track — browse them in Apple Music.
+    private func openInAppleMusic(_ name: String) {
         guard let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: "https://music.apple.com/search?term=\(encoded)") else { return }
         openURL(url)

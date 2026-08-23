@@ -8,6 +8,19 @@
 import SwiftUI
 import SwiftData
 import UIKit
+import CloudKit
+
+/// Tri-state result of the iCloud hydration check we run on first launch.
+/// Driven by explicit polling against the SwiftData model context — we
+/// don't rely on the routing `@Query` to surface CloudKit-mirrored rows
+/// because SwiftData's `@Query` observer doesn't reliably wake up for
+/// CloudKit-driven inserts within the same session (rows are in the
+/// local store but the view keeps reading "0 artists" until relaunch).
+private enum ICloudHydrationOutcome {
+    case checking
+    case found([ArtistData])
+    case empty
+}
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
@@ -33,56 +46,66 @@ struct ContentView: View {
     // iCloud welcome — and tapping Continue there re-imports the same
     // artists, creating duplicates.
     @State private var hasShownIntro = false
+    // Result of the explicit fresh-install hydration check. Drives the
+    // loader → welcome / loader → intro routing. The loader's `.task`
+    // polls `modelContext.fetch(ArtistData)` directly instead of trusting
+    // `@Query` to surface CloudKit-mirrored rows — see the docstring on
+    // `ICloudHydrationOutcome` above.
+    @State private var iCloudHydration: ICloudHydrationOutcome = .checking
     @State private var showingSettings = false
     @StateObject private var deepLinkRouter = DeepLinkRouter()
+    /// App-wide preview player. Lives at the ContentView root so playback
+    /// and the floating mini-player survive any navigation. AlbumView and
+    /// `GlobalMiniPlayer` both read this instance via `@EnvironmentObject`.
+    @StateObject private var previewPlayer = AlbumPreviewPlayer()
     @EnvironmentObject private var navigationDepth: TabNavigationDepth
     @Environment(RefreshCoordinator.self) private var refreshCoordinator
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
         Group {
-            // Hidden context-menu warmup. The first invocation of
-            // `UIContextMenuInteraction` after a cold launch (or after iOS
-            // suspends/resumes the app) takes hundreds of ms to initialize —
-            // long enough that the user's long-press often lifts off before
-            // the menu has time to present, leaving them tapping with no
-            // visual feedback. Attaching a `.contextMenu` to a 1×1
-            // transparent view positioned off-screen forces iOS to allocate
-            // and wire up the interaction up-front, on the same work it was
-            // already doing to install the rest of the hierarchy. The view
-            // itself is unreachable so the user can never trigger it.
-            Color.clear
-                .frame(width: 1, height: 1)
-                .contextMenu { Button("") {} }
-                .accessibilityHidden(true)
-                .offset(x: -10_000, y: -10_000)
-
             if !hasCompletedOnboarding {
-                if !startFreshOverridden && !artists.isEmpty && !hasShownIntro {
-                    // Fresh install + CloudKit hydrated an existing watchlist:
-                    // skip the provider/import flow and offer a quick welcome.
-                    ICloudWelcomeView(
-                        artistCount: artists.count,
-                        trackedCount: artists.filter(\.isTracked).count,
-                        onContinue: {
-                            // If iCloud mirrored artists with isTracked=false
-                            // (e.g. they were imported but never tracked on
-                            // the source device, or the field didn't round-
-                            // trip), the Feed would be empty and the refresh
-                            // button stays disabled. Auto-track everything so
-                            // "use my iCloud artists" actually does something.
-                            if !artists.contains(where: \.isTracked) {
-                                for artist in artists { artist.isTracked = true }
+                if !startFreshOverridden && !hasShownIntro {
+                    switch iCloudHydration {
+                    case .checking:
+                        // Loader polls the model context to see whether
+                        // CloudKit mirrors an existing watchlist before we
+                        // fall through to Intro. Bypasses `@Query` because
+                        // SwiftData's observer can miss CloudKit deliveries
+                        // within the same session.
+                        iCloudHydrationLoader
+                    case .found(let hydrated):
+                        // Pass the explicitly-fetched array straight to the
+                        // welcome view so its display + actions don't
+                        // depend on `@Query` having seen the same rows.
+                        ICloudWelcomeView(
+                            artistCount: hydrated.count,
+                            trackedCount: hydrated.filter(\.isTracked).count,
+                            onContinue: {
+                                // If iCloud mirrored artists with
+                                // isTracked=false (imported but never
+                                // tracked on the source device, or the field
+                                // didn't round-trip), the Feed would be
+                                // empty and the refresh button stays
+                                // disabled. Auto-track everything so "use
+                                // my iCloud artists" actually does
+                                // something.
+                                if !hydrated.contains(where: \.isTracked) {
+                                    for artist in hydrated { artist.isTracked = true }
+                                    try? modelContext.save()
+                                }
+                                hasCompletedOnboarding = true
+                            },
+                            onStartFresh: {
+                                for artist in hydrated { modelContext.delete(artist) }
                                 try? modelContext.save()
+                                startFreshOverridden = true
                             }
-                            hasCompletedOnboarding = true
-                        },
-                        onStartFresh: {
-                            for artist in artists { modelContext.delete(artist) }
-                            try? modelContext.save()
-                            startFreshOverridden = true
-                        }
-                    )
+                        )
+                    case .empty:
+                        Intro()
+                            .onAppear { hasShownIntro = true }
+                    }
                 } else {
                     Intro()
                         .onAppear { hasShownIntro = true }
@@ -95,7 +118,34 @@ struct ContentView: View {
                 tabLayout
             }
         }
+        // Hidden context-menu warmup. The first invocation of
+        // `UIContextMenuInteraction` after a cold launch (or after iOS
+        // suspends/resumes the app) takes hundreds of ms to initialize —
+        // long enough that the user's long-press often lifts off before the
+        // menu has time to present, leaving them tapping with no visual
+        // feedback. Attaching a `.contextMenu` to a 1×1 transparent view
+        // positioned off-screen forces iOS to allocate and wire up the
+        // interaction up-front. The view is unreachable so the user can
+        // never trigger it.
+        //
+        // It lives in an `.overlay` rather than as a sibling inside the
+        // `Group` above: two children made the Group an implicit stack, and
+        // that stack respected the top safe area — which stopped the tab
+        // content from ever reaching under the status bar and left a dead
+        // strip there that had to be painted flat.
+        .overlay(alignment: .topLeading) {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .contextMenu { Button("") {} }
+                .accessibilityHidden(true)
+                .offset(x: -10_000, y: -10_000)
+        }
         .preferredColorScheme(resolvedColorScheme)
+        // Mini-player attachment moved to `tabViewBottomAccessory` on the
+        // TabView itself (iOS 26 API designed for floating-pill tab bars
+        // exactly like ours). The previous `safeAreaInset` here was
+        // crushing the system tab bar into a compressed strip.
+        .animation(.easeInOut(duration: 0.2), value: previewPlayer.isActive)
         // iOS 26's floating tab/nav pills leave the safe-area strips above
         // and below the content uncovered. Without a root background those
         // strips fall through to the system window black, which doesn't
@@ -111,8 +161,25 @@ struct ContentView: View {
         // Route the same way as system deep links so AlbumView pops up.
         .onReceive(NotificationCenter.default.publisher(for: .musicNotifierDeepLinkTapped)) { notification in
             if let url = notification.object as? URL {
+                // We got it live, so the parked copy is redundant — drop it
+                // before the drain below can act on it a second time.
+                PendingDeepLink.clear()
                 deepLinkRouter.handle(url: url, releases: fetchAllReleases())
             }
+        }
+        // Drain a tap that landed before this view existed (cold launch from a
+        // notification). No-op in the common case.
+        .task {
+            if let url = PendingDeepLink.take() {
+                deepLinkRouter.handle(url: url, releases: fetchAllReleases())
+            }
+        }
+        // A deep-linked release may not have reached this device yet on a fresh
+        // install. Re-resolve as CloudKit delivers rows — gated on
+        // `hasPendingRelease` so the ordinary case never pays for the fetch.
+        .onReceive(NotificationCenter.default.publisher(for: .NSPersistentStoreRemoteChange)) { _ in
+            guard deepLinkRouter.hasPendingRelease else { return }
+            deepLinkRouter.resolvePendingRelease(in: fetchAllReleases())
         }
         // Menu-bar / keyboard shortcut hooks (Mac + iPad). These fire from the
         // .commands block on the WindowGroup; they're picked up here so they
@@ -129,7 +196,23 @@ struct ContentView: View {
         .sheet(item: $deepLinkRouter.selectedRelease) { release in
             NavigationStack {
                 AlbumView(release: release)
+                    // This sheet is its own NavigationStack, so it needs the
+                    // same value-based destinations the tab stacks register —
+                    // otherwise tapping the artist name (or a release on the
+                    // pushed artist page) is a no-op inside the sheet.
+                    .navigationDestination(for: ArtistData.self) { artist in
+                        ArtistDetailView(artist: artist)
+                    }
+                    .navigationDestination(for: ReleaseData.self) { release in
+                        AlbumView(release: release)
+                    }
             }
+            // Sheets present in a separate window root, so
+            // `.environmentObject` and `.preferredColorScheme` applied to
+            // ContentView don't reach this hierarchy. Re-inject the
+            // shared player + router so AlbumView can pick them up.
+            .environmentObject(previewPlayer)
+            .environmentObject(deepLinkRouter)
             .preferredColorScheme(resolvedColorScheme)
         }
         .sheet(isPresented: $showingSettings) {
@@ -142,36 +225,232 @@ struct ContentView: View {
             // here so Settings flips with the appearance picker too.
             .preferredColorScheme(resolvedColorScheme)
         }
+        // Outermost env-object injection: wraps the whole modifier chain
+        // including the safe-area inset (`GlobalMiniPlayer`) and tabs/split
+        // layouts below. Sheets explicitly re-inject because they detach
+        // from the env tree.
+        .environmentObject(previewPlayer)
+        .environmentObject(deepLinkRouter)
+    }
+
+    /// Shown on a fresh install while we wait to see whether CloudKit
+    /// will mirror an existing watchlist. As soon as `artists` becomes
+    /// non-empty (handled by the routing logic above), or the timer
+    /// fires, or the user taps Skip, this view is replaced.
+    ///
+    /// 15s is the upper bound: long enough that a real CloudKit pull on
+    /// a slow network has a meaningful chance to deliver the first batch
+    /// of rows, but bounded so a brand-new user is never permanently
+    /// stuck. A Skip button appears after 4s for anyone who knows they
+    /// have nothing in iCloud.
+    @State private var showICloudSkipButton = false
+    private var iCloudHydrationLoader: some View {
+        VStack(spacing: 24) {
+            VStack(spacing: 16) {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(AppTheme.accent)
+                VStack(spacing: 6) {
+                    Text("Restoring from iCloud…")
+                        .font(.headline)
+                        .foregroundStyle(AppTheme.primaryText)
+                    Text("If you've used MusicNotifier before, your watchlist will appear in a moment.")
+                        .font(.footnote)
+                        .foregroundStyle(AppTheme.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                }
+            }
+            if showICloudSkipButton {
+                Button {
+                    iCloudHydration = .empty
+                } label: {
+                    Text("Set up as new")
+                        .font(.footnote.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(AppTheme.accent)
+                .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(AppTheme.background.ignoresSafeArea())
+        .task {
+            // Two-phase wait. Phase 1 (first 8s): keep the loader up while
+            // we listen for *any* signal that CloudKit is actively
+            // syncing — either an `ArtistData` row hits the store, or
+            // we see at least one `NSPersistentStoreRemoteChange`
+            // notification (which fires when SwiftData merges remote
+            // records). Phase 2 (up to 45s total): if CloudKit *did*
+            // signal activity in phase 1, keep waiting for actual
+            // ArtistData rows; otherwise give up early and route to
+            // Intro so a genuinely-new user isn't stuck.
+            //
+            // We poll the model context directly instead of trusting
+            // the routing `@Query`. SwiftData's `@Query` observer can
+            // miss CloudKit-driven inserts within the same session
+            // (symptom: "had to exit and reopen the app to see my
+            // watchlist") — direct fetch always reads live store state.
+            Log.v("[HYDRATE] loader appeared, beginning poll")
+
+            // Diagnostic: do we even have an iCloud account on this device,
+            // and is the app's CloudKit container reachable? Gated on
+            // `Log.verbose` — these are two CloudKit round trips fired on
+            // every cold launch that reaches the loader, and nothing reads
+            // the result except the log.
+            if Log.verbose {
+                Task.detached {
+                    do {
+                        let status = try await CKContainer.default().accountStatus()
+                        Log.v("[HYDRATE] CKContainer.default accountStatus = \(status.rawValue) (1=available, 3=noAccount, 4=temporarilyUnavailable)")
+                    } catch {
+                        Log.v("[HYDRATE] CKContainer.default accountStatus error: \(error)")
+                    }
+                    do {
+                        let named = CKContainer(identifier: "iCloud.com.kern.functional.MusicNotifier")
+                        let status = try await named.accountStatus()
+                        Log.v("[HYDRATE] named container accountStatus = \(status.rawValue)")
+                    } catch {
+                        Log.v("[HYDRATE] named container accountStatus error: \(error)")
+                    }
+                }
+            }
+
+            let descriptor = FetchDescriptor<ArtistData>()
+            let releaseDescriptor = FetchDescriptor<ReleaseData>()
+            let startDate = Date()
+            // Short ceiling: the loader is for the lucky case where
+            // CloudKit happens to deliver fast. Slow-case users (where
+            // hydration takes minutes) get to Intro and can pick the
+            // explicit "I already have a watchlist in iCloud" path.
+            let initialWait: TimeInterval = 8
+            let maxWait: TimeInterval = 8
+
+            // Lightweight box for the remote-change observer to flip
+            // without needing actor/atomic gymnastics. `@unchecked Sendable`
+            // is sound here and not a shortcut: the observer is registered
+            // with `queue: .main`, and every read below happens inside this
+            // `.task`, which inherits the view's main-actor isolation — so
+            // all access is main-thread serialized.
+            final class ActivityFlag: @unchecked Sendable { var fired = false; var count = 0 }
+            let activity = ActivityFlag()
+            let observer = NotificationCenter.default.addObserver(
+                forName: .NSPersistentStoreRemoteChange,
+                object: nil,
+                queue: .main
+            ) { note in
+                activity.fired = true
+                activity.count += 1
+                Log.v("[HYDRATE] NSPersistentStoreRemoteChange #\(activity.count) userInfo=\(note.userInfo ?? [:])")
+            }
+            defer {
+                NotificationCenter.default.removeObserver(observer)
+                Log.v("[HYDRATE] loader task exiting, observer removed")
+            }
+
+            var pollCount = 0
+            while true {
+                let elapsed = Date().timeIntervalSince(startDate)
+                pollCount += 1
+
+                // Counted only for the log line — skip both table counts
+                // entirely when logging is off, otherwise every 750ms tick
+                // of the launch loader pays for two full counts it discards.
+                if Log.verbose {
+                    let artistCount = (try? modelContext.fetchCount(descriptor)) ?? -1
+                    let releaseCount = (try? modelContext.fetchCount(releaseDescriptor)) ?? -1
+                    Log.v(String(format: "[HYDRATE] poll #%d t=%.1fs artists=%d releases=%d remoteChanges=%d",
+                                 pollCount, elapsed, artistCount, releaseCount, activity.count))
+                }
+
+                if let fetched = try? modelContext.fetch(descriptor), !fetched.isEmpty {
+                    Log.v("[HYDRATE] found \(fetched.count) artists, transitioning to .found")
+                    iCloudHydration = .found(fetched)
+                    return
+                }
+
+                // Reveal the skip button at 5s so a genuinely-new user
+                // can opt out without staring at the spinner for 45s.
+                if !showICloudSkipButton && elapsed > 5 {
+                    await MainActor.run {
+                        withAnimation { showICloudSkipButton = true }
+                    }
+                }
+
+                // Early bail-out: if we've waited the initial window
+                // and CloudKit hasn't even signalled a remote change,
+                // there's nothing to wait for.
+                if elapsed > initialWait && !activity.fired {
+                    Log.v("[HYDRATE] no remote-change activity in \(Int(elapsed))s — routing to Intro")
+                    iCloudHydration = .empty
+                    return
+                }
+
+                // Hard ceiling so the loader can't outstay its welcome
+                // even if CloudKit is delivering only metadata records
+                // (zone setup, change tokens) that never become artists.
+                if elapsed > maxWait {
+                    Log.v("[HYDRATE] hit \(Int(maxWait))s ceiling — routing to Intro (remoteChanges=\(activity.count))")
+                    iCloudHydration = .empty
+                    return
+                }
+
+                try? await Task.sleep(nanoseconds: 750_000_000)
+            }
+        }
     }
 
     private var tabLayout: some View {
-        TabView(selection: $deepLinkRouter.selectedTab) {
-            HomeView()
-                .tabItem { Label("Feed", systemImage: "music.note") }
-                .tag(0)
-            UpcomingView()
-                .tabItem { Label("Upcoming", systemImage: "calendar") }
-                .tag(1)
-            Artists()
-                .tabItem { Label("Artists", systemImage: "person.2") }
-                .tag(2)
-            if enableVideosTab {
-                VideosView()
-                    .tabItem { Label("Videos", systemImage: "play.rectangle") }
-                    .tag(3)
+        // Custom overlay approach: the TabView never gets a modifier
+        // tied to playback state, so its structural identity is
+        // permanent and iOS 26 can't reset the selected tab on
+        // accessory attach/detach. The mini-player is a sibling
+        // overlay in the same ZStack, conditionally rendered, styled
+        // to mimic the system's floating glass pill (capsule shape,
+        // ultra-thin material, sitting just above the tab-bar pill).
+        ZStack(alignment: .bottom) {
+            TabView(selection: $deepLinkRouter.selectedTab) {
+                HomeView()
+                    .tabItem { Label("Feed", systemImage: "music.note") }
+                    .tag(0)
+                UpcomingView()
+                    .tabItem { Label("Upcoming", systemImage: "calendar") }
+                    .tag(1)
+                Artists()
+                    .tabItem { Label("Artists", systemImage: "person.2") }
+                    .tag(2)
+                if enableVideosTab {
+                    VideosView()
+                        .tabItem { Label("Videos", systemImage: "play.rectangle") }
+                        .tag(3)
+                }
+                if enableConcertsTab {
+                    ConcertsView()
+                        .tabItem { Label("Concerts", systemImage: "ticket") }
+                        .tag(4)
+                }
             }
-            if enableConcertsTab {
-                ConcertsView()
-                    .tabItem { Label("Concerts", systemImage: "ticket") }
-                    .tag(4)
+            // Tint drives the *selected* tab item and every unstyled control
+            // inside the tabs (toolbar `Button("Done")`, `.searchable` accents,
+            // …). It used to be `.white`, which is invisible on iOS 26's light
+            // glass tab bar / toolbar pills — the selected tab and the Add
+            // sheet's Done button both disappeared in light mode.
+            .tint(AppTheme.accent)
+            // simultaneousGesture lets the swipe run alongside the underlying
+            // tap recognizers. The minimumDistance + 80pt horizontal threshold
+            // (in tabSwitchGesture) make the swipe deliberate, so a casual tap
+            // never trips it.
+            .simultaneousGesture(tabSwitchGesture)
+
+            if previewPlayer.isActive {
+                GlobalMiniPlayer(renderAsCard: true)
+                    // Sit close to the tab pill so the two read as a
+                    // tight stack.
+                    .padding(.bottom, 58)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .tint(.white)
-        // simultaneousGesture lets the swipe run alongside the underlying
-        // tap recognizers. The minimumDistance + 80pt horizontal threshold
-        // (in tabSwitchGesture) make the swipe deliberate, so a casual tap
-        // never trips it.
-        .simultaneousGesture(tabSwitchGesture)
+        .animation(.easeInOut(duration: 0.22), value: previewPlayer.isActive)
     }
 
     /// Sidebar + detail layout for iPad / Mac. Each row uses a Mail/Reminders-style
@@ -188,6 +467,13 @@ struct ContentView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .tint(AppTheme.accent)
+        // iPad / Catalyst doesn't have a TabView, so the tabViewBottomAccessory
+        // path doesn't apply. Use a safe-area inset on the split layout itself
+        // — no floating tab pill underneath here, so the card just sits at
+        // the bottom of the detail column.
+        .safeAreaInset(edge: .bottom) {
+            GlobalMiniPlayer(renderAsCard: true)
+        }
     }
 
     // MARK: - Sidebar
@@ -551,7 +837,7 @@ private enum SidebarDestination {
 
 #Preview {
     ContentView()
-        .modelContainer(for: [Item.self, ArtistData.self, ReleaseData.self], inMemory: true)
+        .modelContainer(for: [ArtistData.self, ReleaseData.self], inMemory: true)
         .environment(RefreshCoordinator())
         .environmentObject(TabNavigationDepth())
 }
