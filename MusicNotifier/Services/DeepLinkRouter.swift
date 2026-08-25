@@ -65,15 +65,57 @@ final class DeepLinkRouter: ObservableObject {
     @Published var selectedTab = 0
     @Published var selectedRelease: ReleaseData?
 
+    /// A release deep link whose row wasn't in the local store yet.
+    ///
+    /// A cold launch from a notification tap can easily outrun CloudKit
+    /// hydration on a fresh install, and the previous code simply assigned
+    /// `selectedRelease = releases.first { ... }` — i.e. `nil` — so the tap
+    /// switched to the Feed and then did nothing at all, with no retry and no
+    /// explanation. Held here and re-resolved as the store fills in.
+    private var pendingReleaseID: String?
+    private var pendingSince: Date?
+
+    /// Cap on how long an unresolved deep link keeps retrying. Popping an
+    /// album open long after the tap would be jarring.
+    private let pendingTimeout: TimeInterval = 60
+
+    var hasPendingRelease: Bool { pendingReleaseID != nil }
+
     func handle(url: URL, releases: [ReleaseData]) {
         guard let deepLink = MusicNotifierDeepLink(url: url) else { return }
 
         switch deepLink {
         case .today:
             selectedTab = 0
+            clearPending()
         case .release(let releaseID):
             selectedTab = 0
-            selectedRelease = releases.first { $0.providerID == releaseID }
+            if let match = releases.first(where: { $0.providerID == releaseID }) {
+                clearPending()
+                selectedRelease = match
+            } else {
+                pendingReleaseID = releaseID
+                pendingSince = Date()
+            }
         }
+    }
+
+    /// Retry a deep link that arrived before its release existed locally.
+    /// Callers should check `hasPendingRelease` first — it lets them skip
+    /// fetching the release table on every store change for nothing.
+    func resolvePendingRelease(in releases: [ReleaseData]) {
+        guard let pendingReleaseID, let pendingSince else { return }
+        guard Date().timeIntervalSince(pendingSince) < pendingTimeout else {
+            clearPending()
+            return
+        }
+        guard let match = releases.first(where: { $0.providerID == pendingReleaseID }) else { return }
+        clearPending()
+        selectedRelease = match
+    }
+
+    private func clearPending() {
+        pendingReleaseID = nil
+        pendingSince = nil
     }
 }

@@ -77,7 +77,7 @@ enum WidgetSnapshotWriter {
             try data.write(to: url, options: [.atomic])
             WidgetCenter.shared.reloadAllTimelines()
         } catch {
-            print("Failed to write widget snapshot: \(error)")
+            Log.v("Failed to write widget snapshot: \(error)")
         }
     }
 

@@ -40,7 +40,7 @@ enum BackgroundRefreshScheduler {
             // only print unexpected failures.
             let nsError = error as NSError
             if nsError.domain != "BGSystemTaskSchedulerErrorDomain" || nsError.code != 3 {
-                print("Could not schedule background refresh: \(error)")
+                Log.v("Could not schedule background refresh: \(error)")
             }
         }
         #endif

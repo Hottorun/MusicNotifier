@@ -10,7 +10,6 @@ enum RefreshPhase: String, Sendable {
     case warming = "Connecting…"
     case releases = "Checking releases"
     case videos = "Checking videos"
-    case concerts = "Checking concerts"
     case finishing = "Finishing up"
 }
 
@@ -20,7 +19,7 @@ struct ReleaseRefreshProgress: Sendable {
     let currentArtistName: String
     var phase: RefreshPhase = .releases
     /// When true, render an indeterminate sweep — `checkedArtists`/`totalArtists` are
-    /// not meaningful for this phase (video / concert tail).
+    /// not meaningful for this phase (the video tail).
     var isIndeterminate: Bool = false
 
     var fractionCompleted: Double {
@@ -206,10 +205,14 @@ struct ReleaseRefreshService {
                 if !summarySnapshot.isEmpty {
                     await scheduler.scheduleReleaseSummaryNotification(specs: summarySnapshot)
                 }
-                for spec in upcomingSnapshot {
-                    await scheduler.scheduleReleaseDayNotification(spec: spec, hour: hour, minute: minute)
-                    await scheduler.schedulePreReleaseAlerts(spec: spec, hour: hour, minute: minute)
-                }
+                // Budgeted + pruned: iOS caps pending local notifications at
+                // 64 per app and silently drops the overflow, so this can't
+                // just add one request per release.
+                await scheduler.syncUpcomingReleaseAlerts(
+                    specs: upcomingSnapshot,
+                    hour: hour,
+                    minute: minute
+                )
             }
         }
 
@@ -236,6 +239,175 @@ struct ReleaseRefreshService {
             totalArtists: result.totalArtists,
             failures: result.failures
         )
+    }
+
+    // MARK: - Streaming refresh
+
+    /// Streaming-flush state owned by the coordinator across batches. Holds
+    /// the providerIDs of releases the actor inserted/updated so `finalize`
+    /// can fetch just those rows back when building notification specs.
+    struct StreamingRefreshState: Sendable {
+        var newReleaseIDs: [String] = []
+        var dateChangedIDs: [String] = []
+        var newReleaseCount: Int = 0
+        var updatedReleaseCount: Int = 0
+        var storageFailure: String?
+    }
+
+    /// Upsert a single batch of fetched releases (off-main) and update the
+    /// running streaming state. Safe to call repeatedly during a refresh —
+    /// each call is one bounded SwiftData transaction that fires `@Query`
+    /// observers, so the UI fills in as artists complete.
+    func applyStreamingBatch(
+        releases: [FetchedRelease],
+        state: inout StreamingRefreshState,
+        actor: ReleaseUpsertActor,
+        now: Date
+    ) async {
+        let output = await actor.applyBatch(fetchedReleases: releases, now: now)
+        state.newReleaseIDs.append(contentsOf: output.newReleaseIDs)
+        state.dateChangedIDs.append(contentsOf: output.dateChangedIDs)
+        state.newReleaseCount += output.newReleaseCount
+        state.updatedReleaseCount += output.updatedReleaseCount
+        if let failure = output.storageFailure, state.storageFailure == nil {
+            state.storageFailure = failure
+        }
+    }
+
+    /// End-of-refresh finalize. Builds notification specs + widget snapshot +
+    /// playlist candidates from the rows the streaming batches touched, then
+    /// kicks off the same detached notification / widget / playlist work the
+    /// non-streaming `apply` path does.
+    @MainActor
+    func finalizeRefresh(
+        state: StreamingRefreshState,
+        failures: [String],
+        checkedArtists: Int,
+        totalArtists: Int,
+        trackedArtists: [ArtistData],
+        modelContext: ModelContext,
+        scheduleNotifications: Bool,
+        notificationHour: Int,
+        notificationMinute: Int
+    ) async -> ReleaseRefreshSummary {
+        let now = Date()
+        let defaults = UserDefaults.standard
+        defaults.set(now.timeIntervalSince1970, forKey: AppSettings.lastRefreshAt)
+
+        let artistUpdates = ReleaseUpsertActor.ArtistUpdates(
+            resolvedCatalogIDs: [:],
+            resolvedArtworkURLs: [:],
+            trackedProviderIDs: trackedArtists.map(\.providerID)
+        )
+
+        let notificationsEnabled = defaults.object(forKey: AppSettings.notificationsEnabled) as? Bool ?? true
+        let upcomingNotificationsEnabled = defaults.object(forKey: AppSettings.upcomingReleaseNotificationsEnabled) as? Bool ?? true
+        let sameDaySummaryEnabled = defaults.object(forKey: AppSettings.sameDayReleaseSummaryEnabled) as? Bool ?? true
+        let globalPreference = ArtistNotificationPreference(
+            rawValue: defaults.string(forKey: AppSettings.globalNotificationReleasePreference) ?? ArtistNotificationPreference.all.rawValue
+        ) ?? .all
+        let preferenceByArtist = Dictionary(uniqueKeysWithValues: trackedArtists.map {
+            ($0.providerID, ArtistNotificationPreference(rawValue: $0.notificationPreference) ?? .inherit)
+        })
+        let genresByArtistID = Dictionary(
+            uniqueKeysWithValues: trackedArtists.map { ($0.providerID, $0.genres ?? []) }
+        )
+
+        let actor = ReleaseUpsertActor(modelContainer: modelContext.container)
+        let finalizeOutput = await actor.finalize(
+            newReleaseIDs: state.newReleaseIDs,
+            dateChangedIDs: state.dateChangedIDs,
+            now: now,
+            sameDaySummaryEnabled: scheduleNotifications && notificationsEnabled && sameDaySummaryEnabled,
+            upcomingEnabled: scheduleNotifications && notificationsEnabled && upcomingNotificationsEnabled,
+            context: ReleaseUpsertActor.PerArtistContext(
+                preferenceByArtist: preferenceByArtist,
+                genresByArtist: genresByArtistID,
+                globalPreference: globalPreference
+            ),
+            artistUpdates: artistUpdates
+        )
+
+        let storageFailure = state.storageFailure ?? finalizeOutput.storageFailure
+        if let storageFailure {
+            return ReleaseRefreshSummary(
+                newReleaseCount: state.newReleaseCount,
+                updatedReleaseCount: state.updatedReleaseCount,
+                checkedArtists: checkedArtists,
+                totalArtists: totalArtists,
+                failures: failures + ["Storage: \(storageFailure)"]
+            )
+        }
+        defaults.set(now.timeIntervalSince1970, forKey: AppSettings.lastSuccessfulRefreshAt)
+
+        if scheduleNotifications && notificationsEnabled
+            && (!finalizeOutput.summarySpecs.isEmpty || !finalizeOutput.upcomingSpecs.isEmpty) {
+            _ = await NotificationScheduler().requestAuthorization()
+            let summarySnapshot = finalizeOutput.summarySpecs
+            let upcomingSnapshot = finalizeOutput.upcomingSpecs
+            let hour = notificationHour
+            let minute = notificationMinute
+            Task.detached(priority: .utility) {
+                let scheduler = NotificationScheduler()
+                if !summarySnapshot.isEmpty {
+                    await scheduler.scheduleReleaseSummaryNotification(specs: summarySnapshot)
+                }
+                // Budgeted + pruned: iOS caps pending local notifications at
+                // 64 per app and silently drops the overflow, so this can't
+                // just add one request per release.
+                await scheduler.syncUpcomingReleaseAlerts(
+                    specs: upcomingSnapshot,
+                    hour: hour,
+                    minute: minute
+                )
+            }
+        }
+
+        let widgetSnapshot = finalizeOutput.widgetSnapshot
+        let artworkRequests = finalizeOutput.widgetRequests
+        Task.detached(priority: .utility) {
+            WidgetSnapshotWriter.persist(snapshot: widgetSnapshot)
+            await WidgetSnapshotWriter.cacheArtwork(for: artworkRequests)
+        }
+
+        if !finalizeOutput.playlistCandidates.isEmpty {
+            let candidates = finalizeOutput.playlistCandidates
+            Task { @MainActor in
+                await AppleMusicPlaylistSync().sync(candidates: candidates)
+            }
+        }
+
+        return ReleaseRefreshSummary(
+            newReleaseCount: state.newReleaseCount,
+            updatedReleaseCount: state.updatedReleaseCount,
+            checkedArtists: checkedArtists,
+            totalArtists: totalArtists,
+            failures: failures
+        )
+    }
+
+    /// Apply just the tracked-artist metadata (resolved catalog IDs, artwork
+    /// URLs, lastCheckedAt) in a single MainActor transaction. Called by the
+    /// streaming refresh path right before `finalizeRefresh` so the artist-
+    /// metadata write doesn't fire its own separate `@Query` notification.
+    @MainActor
+    func applyArtistMetadata(
+        resolvedCatalogIDs: [String: String],
+        resolvedArtworkURLs: [String: URL],
+        trackedArtists: [ArtistData],
+        modelContext: ModelContext,
+        now: Date
+    ) {
+        for artist in trackedArtists {
+            if let catalogID = resolvedCatalogIDs[artist.providerID] {
+                artist.catalogArtistID = catalogID
+            }
+            if let artwork = resolvedArtworkURLs[artist.providerID] {
+                artist.artworkURL = artwork
+            }
+            artist.lastCheckedAt = now
+        }
+        try? modelContext.save()
     }
 
     /// Convenience wrapper: fetch off-main + apply on main. Used by the background scheduler

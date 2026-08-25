@@ -2,14 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSAppleMusicUsageDescription</key>
-	<string>MusicNotifier needs access to your Apple Music library to track new releases from your favorite artists.</string>
-	<key>NSCalendarsFullAccessUsageDescription</key>
-	<string>MusicNotifier needs calendar access so you can add upcoming releases to your calendar.</string>
-	<key>NSCalendarsUsageDescription</key>
-	<string>MusicNotifier needs calendar access so you can add upcoming releases to your calendar.</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>MusicNotifier uses your location to surface concerts happening near you.</string>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER).release-refresh</string>
@@ -25,9 +17,22 @@
 			</array>
 		</dict>
 	</array>
+	<!-- Only HTTPS to Apple Music / Last.fm / Spotify plus Apple's own CloudKit
+	     transport — no proprietary or non-exempt encryption, so the export
+	     compliance question is answered here instead of on every upload. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>NSAppleMusicUsageDescription</key>
+	<string>MusicNotifier needs access to your Apple Music library to track new releases from your favorite artists.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>MusicNotifier needs calendar access so you can add upcoming releases to your calendar.</string>
+	<!-- `fetch` backs the BGAppRefreshTask in BackgroundRefreshScheduler;
+	     `remote-notification` is what SwiftData's CloudKit mirroring needs to
+	     act on silent sync pushes. `processing` was declared but no
+	     BGProcessingTask is ever submitted, so it's dropped rather than left
+	     as an unused capability for review to ask about. -->
 	<key>UIBackgroundModes</key>
 	<array>
-		<string>processing</string>
 		<string>fetch</string>
 		<string>remote-notification</string>
 	</array>

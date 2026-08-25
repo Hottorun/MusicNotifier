@@ -17,6 +17,12 @@ enum AppSettings {
     static let lastBackgroundRefreshAt = "lastBackgroundRefreshAt"
     static let lastBackgroundRefreshResult = "lastBackgroundRefreshResult"
     static let lastStorefrontCountryCode = "lastStorefrontCountryCode"
+    /// Last observed `MusicAuthorization.Status.rawValue`. Written by the
+    /// launch + foreground auth re-check in `MusicNotifierApp`; read by
+    /// any view that needs to gate UI on whether MusicKit access is still
+    /// granted (refresh button, empty states, etc.).
+    static let lastKnownMusicAuthStatus = "lastKnownMusicAuthStatus"
+    static let lastKnownMusicAuthCheckedAt = "lastKnownMusicAuthCheckedAt"
     /// MUST match the `com.apple.security.application-groups` entry in both
     /// MusicNotifier.entitlements and MusicNotifierWidgets.entitlements. Mismatch
     /// silently sends writes/reads to nonexistent containers — widget shows no data.
@@ -40,7 +46,11 @@ enum AppSettings {
     static let appearance = "appearance"
     static let spotifyClientID = "spotifyClientID"
     static let spotifyRedirectURI = "spotifyRedirectURI"
-    static let defaultSpotifyClientID = "f0dd7984f000484a956ca7e7771af76a"
+    /// No client ID ships with the app. Spotify is not a selectable provider in
+    /// v1 — onboarding offers Apple Music only — so `SpotifyService` stays
+    /// unconfigured (`isConfigured == false`) unless a value is written to
+    /// `spotifyClientID` at runtime. Re-enabling Spotify means restoring a
+    /// default here *and* putting the provider back in the onboarding picker.
     static let defaultSpotifyRedirectURI = "musicnotifier://spotify-auth"
     static let spotifyAccessToken = "spotifyAccessToken"
     static let spotifyRefreshToken = "spotifyRefreshToken"
@@ -80,27 +90,6 @@ enum AppSettings {
     /// Which two months the Upcoming calendar shows. `"future"` = current +
     /// next (default — matches the tab's name). `"past"` = previous + current.
     static let upcomingCalendarDirection = "upcomingCalendarDirection"
-
-    // MARK: - Concerts (Bandsintown)
-    /// Master toggle: when true, the Concerts tab is shown and concert refresh
-    /// runs alongside release refresh.
-    static let enableConcertsTab = "enableConcertsTab"
-    /// `true` → use CoreLocation for the Nearby filter. `false` → use the
-    /// manual city override below.
-    static let useLocationForNearby = "useLocationForNearby"
-    /// Free-text city the user picked. Geocoded once to lat/long and cached
-    /// in `cachedLatitude`/`cachedLongitude`.
-    static let manualCityOverride = "manualCityOverride"
-    /// Radius in kilometers for the Nearby filter and notification trigger.
-    static let nearbyRadiusKm = "nearbyRadiusKm"
-    /// Send a notification when a tracked artist announces a show within
-    /// `nearbyRadiusKm` of the cached location.
-    static let concertNotificationsEnabled = "concertNotificationsEnabled"
-
-    // Cached location (CoreLocation last fix, or geocoded manual city).
-    static let cachedLatitude = "cachedLatitude"
-    static let cachedLongitude = "cachedLongitude"
-    static let cachedLocationTimestamp = "cachedLocationTimestamp"
 
     static let albumBadgeColorHex = "albumBadgeColorHex"
     static let epBadgeColorHex = "epBadgeColorHex"

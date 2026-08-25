@@ -8,7 +8,6 @@ import SwiftUI
 import SwiftData
 import UserNotifications
 import CloudKit
-import CoreLocation
 
 private enum PreAlertOption: Int, CaseIterable, Identifiable {
     case oneDay = 1
@@ -37,7 +36,6 @@ private enum PreAlertOption: Int, CaseIterable, Identifiable {
 struct SettingsView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
-    @Environment(RefreshCoordinator.self) private var refreshCoordinator
     @AppStorage(AppSettings.autoRefreshOnLaunch) private var autoRefreshOnLaunch = true
     @AppStorage(AppSettings.releaseNotificationHour) private var releaseNotificationHour = 8
     @AppStorage(AppSettings.releaseNotificationMinute) private var releaseNotificationMinute = 0
@@ -66,21 +64,19 @@ struct SettingsView: View {
     @AppStorage(AppSettings.videoNotificationsEnabled) private var videoNotificationsEnabled: Bool = false
     @AppStorage(AppSettings.includeInterviewVideos) private var includeInterviewVideos: Bool = false
     @AppStorage(AppSettings.upcomingCalendarDirection) private var calendarDirectionRaw: String = CalendarDirection.future.rawValue
-    @AppStorage(AppSettings.enableConcertsTab) private var enableConcertsTab: Bool = false
-    @AppStorage(AppSettings.useLocationForNearby) private var useLocationForNearby: Bool = false
-    @AppStorage(AppSettings.manualCityOverride) private var manualCityOverride: String = ""
-    @AppStorage(AppSettings.nearbyRadiusKm) private var nearbyRadiusKm: Double = 50
-    @AppStorage(AppSettings.concertNotificationsEnabled) private var concertNotificationsEnabled: Bool = false
     @AppStorage(AppSettings.appearance) private var appearanceRaw: String = "system"
     @Query(sort: \ArtistData.name) private var artists: [ArtistData]
     @Query(sort: \ReleaseData.firstSeenAt, order: .reverse) private var releases: [ReleaseData]
     @State private var statusMessage: String?
     @State private var showingDangerZone = false
-    @State private var showingDeveloperInfo = false
-    @State private var diagnosticReport: String?
-    @State private var isDiagnosing = false
-    @State private var showingDiagnosticPicker = false
-    @State private var diagnosticPickerSearch: String = ""
+    @State private var pendingDangerAction: PendingDangerAction?
+
+    /// Counted once per body pass instead of walking the whole roster twice
+    /// inside the danger-zone row (once for `isDisabled`, once for the
+    /// confirmation copy).
+    private var untrackedArtistCount: Int {
+        artists.reduce(into: 0) { $0 += $1.isTracked ? 0 : 1 }
+    }
 
     private var trackedArtists: [ArtistData] {
         artists.filter(\.isTracked)
@@ -89,8 +85,8 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             // LazyVStack so sections below the fold (Calendar / Videos /
-            // Concerts / Gestures / Support / Danger) don't get instantiated
-            // until scrolled into view. First-open paints noticeably faster.
+            // Gestures / Danger) don't get instantiated until scrolled into
+            // view. First-open paints noticeably faster.
             LazyVStack(spacing: 24) {
                 statsCard
 
@@ -147,23 +143,7 @@ struct SettingsView: View {
 
                 videosSection
 
-                concertsSection
-
                 gesturesSection
-
-                section(title: "Support the app") {
-                    settingsButton("Send feedback or report a bug", systemImage: "envelope") {
-                        statusMessage = "Feedback channel isn't wired up yet — coming soon."
-                    }
-                    settingsDivider
-                    settingsButton("Request a feature", systemImage: "lightbulb") {
-                        statusMessage = "Feature requests aren't wired up yet — coming soon."
-                    }
-                    settingsDivider
-                    settingsButton("Leave a tip", systemImage: "heart") {
-                        statusMessage = "Tip jar isn't set up yet — coming soon."
-                    }
-                }
 
                 section(title: "Danger zone", tint: .red) {
                     Button {
@@ -180,15 +160,57 @@ struct SettingsView: View {
 
                     if showingDangerZone {
                         settingsDivider
-                        dangerButton("Reset onboarding only", systemImage: "arrow.uturn.backward", action: resetOnboardingOnly)
-                        dangerButton("Clear releases", systemImage: "trash", isDisabled: releases.isEmpty, action: clearReleases)
-                        dangerButton("Clear untracked artists", systemImage: "person.crop.circle.badge.minus", isDisabled: artists.filter { !$0.isTracked }.isEmpty, action: clearUntrackedArtists)
-                        dangerButton("Clear old releases (180d+)", systemImage: "calendar.badge.minus", isDisabled: releases.isEmpty, action: clearStaleReleases)
-                        dangerButton("Clear all artists & releases", systemImage: "person.crop.circle.badge.xmark", isDisabled: artists.isEmpty, action: clearArtistsAndReleases)
+                        dangerButton(
+                            "Reset onboarding only",
+                            systemImage: "arrow.uturn.backward",
+                            confirmation: (
+                                "You'll be taken back through setup. Your artists and releases are kept.",
+                                "Reset Onboarding"
+                            ),
+                            action: resetOnboardingOnly
+                        )
+                        dangerButton(
+                            "Clear releases",
+                            systemImage: "trash",
+                            isDisabled: releases.isEmpty,
+                            confirmation: (
+                                "Deletes all \(releases.count) stored releases on this device and every device signed in to your iCloud account. Your tracked artists are kept, and the next refresh will repopulate recent releases.",
+                                "Clear Releases"
+                            ),
+                            action: clearReleases
+                        )
+                        dangerButton(
+                            "Clear untracked artists",
+                            systemImage: "person.crop.circle.badge.minus",
+                            isDisabled: untrackedArtistCount == 0,
+                            confirmation: (
+                                "Deletes \(untrackedArtistCount) artists you aren't tracking. This syncs to your other devices and can't be undone.",
+                                "Clear Untracked"
+                            ),
+                            action: clearUntrackedArtists
+                        )
+                        dangerButton(
+                            "Clear old releases (180d+)",
+                            systemImage: "calendar.badge.minus",
+                            isDisabled: releases.isEmpty,
+                            confirmation: (
+                                "Deletes releases older than 180 days. This syncs to your other devices and can't be undone.",
+                                "Clear Old Releases"
+                            ),
+                            action: clearStaleReleases
+                        )
+                        dangerButton(
+                            "Clear all artists & releases",
+                            systemImage: "person.crop.circle.badge.xmark",
+                            isDisabled: artists.isEmpty,
+                            confirmation: (
+                                "Deletes your entire watchlist — all \(artists.count) artists and \(releases.count) releases — on this device and every device signed in to your iCloud account. This can't be undone.",
+                                "Delete Everything"
+                            ),
+                            action: clearArtistsAndReleases
+                        )
                     }
                 }
-
-                developerInfoSection
 
                 if let statusMessage {
                     Text(statusMessage)
@@ -209,63 +231,22 @@ struct SettingsView: View {
         // visible immediately, even if the enclosing sheet hadn't picked up
         // the parent's preferredColorScheme yet.
         .preferredColorScheme(resolvedColorScheme)
-        .sheet(isPresented: $showingDiagnosticPicker) {
-            NavigationStack {
-                List {
-                    ForEach(filteredDiagnosticArtists, id: \.providerID) { artist in
-                        Button {
-                            showingDiagnosticPicker = false
-                            runArtistDiagnostic(artist: artist)
-                        } label: {
-                            HStack {
-                                Text(artist.name)
-                                    .foregroundStyle(AppTheme.primaryText)
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(AppTheme.secondary)
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .listStyle(.plain)
-                .searchable(text: $diagnosticPickerSearch, placement: .navigationBarDrawer(displayMode: .always), prompt: "Find artist")
-                .navigationTitle("Pick artist")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("Cancel") { showingDiagnosticPicker = false }
-                    }
-                }
+        .confirmationDialog(
+            pendingDangerAction?.title ?? "",
+            isPresented: Binding(
+                get: { pendingDangerAction != nil },
+                set: { if !$0 { pendingDangerAction = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDangerAction
+        ) { pending in
+            Button(pending.confirmLabel, role: .destructive) {
+                pending.perform()
+                pendingDangerAction = nil
             }
-            .preferredColorScheme(resolvedColorScheme)
-        }
-        .sheet(item: Binding(
-            get: { diagnosticReport.map(DiagnosticReportPayload.init) },
-            set: { if $0 == nil { diagnosticReport = nil } }
-        )) { payload in
-            NavigationStack {
-                ScrollView {
-                    Text(payload.body)
-                        .font(.system(.footnote, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(16)
-                }
-                .navigationTitle("Fetch diagnostic")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("Done") { diagnosticReport = nil }
-                    }
-                    ToolbarItem(placement: .topBarLeading) {
-                        ShareLink(item: payload.body) { Image(systemName: "square.and.arrow.up") }
-                    }
-                }
-            }
-            .preferredColorScheme(resolvedColorScheme)
+            Button("Cancel", role: .cancel) { pendingDangerAction = nil }
+        } message: { pending in
+            Text(pending.message)
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -273,35 +254,6 @@ struct SettingsView: View {
                     dismiss()
                 }
                 .foregroundStyle(AppTheme.accent)
-            }
-        }
-    }
-
-    /// Identifiable wrapper so the report can drive a `.sheet(item:)`.
-    private struct DiagnosticReportPayload: Identifiable {
-        let body: String
-        var id: String { body }
-    }
-
-    private var filteredDiagnosticArtists: [ArtistData] {
-        let needle = diagnosticPickerSearch.trimmingCharacters(in: .whitespacesAndNewlines)
-        if needle.isEmpty { return trackedArtists }
-        return trackedArtists.filter { $0.name.localizedCaseInsensitiveContains(needle) }
-    }
-
-    private func runArtistDiagnostic(artist: ArtistData) {
-        isDiagnosing = true
-        let input = ArtistFetchInput(
-            providerID: artist.providerID,
-            name: artist.name,
-            provider: artist.provider,
-            catalogArtistID: artist.catalogArtistID
-        )
-        Task {
-            let report = await AppleMusicReleaseService().diagnoseArtistFetch(for: input)
-            await MainActor.run {
-                diagnosticReport = report
-                isDiagnosing = false
             }
         }
     }
@@ -386,25 +338,6 @@ struct SettingsView: View {
         .disabled(isDisabled)
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-    }
-
-    private func settingsButton(_ title: String, systemImage: String, isDisabled: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack {
-                Label(title, systemImage: systemImage)
-                    .font(.subheadline)
-                    .foregroundStyle(isDisabled ? AppTheme.secondary : AppTheme.primaryText)
-                Spacer(minLength: 8)
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(AppTheme.secondary)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(isDisabled)
     }
 
     /// Unified per-kind row: visibility toggle + label + (for kinds that show a
@@ -497,7 +430,9 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(kindDisplayName(kind))
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(dimmed ? AppTheme.secondary : .white)
+                    // `.white` here left every release-type row unlabeled in
+                    // light mode — the section read as six anonymous toggles.
+                    .foregroundStyle(dimmed ? AppTheme.secondary : AppTheme.primaryText)
                 if hex == nil {
                     Text("No badge — singles render unlabeled")
                         .font(.caption2)
@@ -597,88 +532,6 @@ struct SettingsView: View {
         }
     }
 
-    private var concertsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("CONCERTS")
-                .font(.caption.weight(.semibold))
-                .tracking(1.2)
-                .foregroundStyle(AppTheme.secondary)
-                .padding(.horizontal, 24)
-
-            VStack(spacing: 0) {
-                settingsToggle("Show Concerts tab", isOn: $enableConcertsTab)
-                if enableConcertsTab {
-                    settingsDivider
-                    settingsToggle("Use my location for Nearby", isOn: Binding(
-                        get: { useLocationForNearby },
-                        set: { newValue in
-                            useLocationForNearby = newValue
-                            if newValue {
-                                LocationService.shared.requestAuthorization()
-                                Task { _ = await LocationService.shared.currentLocation() }
-                            }
-                        }
-                    ))
-                    if !useLocationForNearby {
-                        settingsDivider
-                        HStack {
-                            Text("City")
-                                .foregroundStyle(AppTheme.primaryText)
-                            Spacer()
-                            TextField("Berlin", text: $manualCityOverride)
-                                .multilineTextAlignment(.trailing)
-                                .foregroundStyle(AppTheme.secondary)
-                                .onSubmit { Task { await geocodeManualCity() } }
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                    }
-                    settingsDivider
-                    HStack {
-                        Text("Radius")
-                            .foregroundStyle(AppTheme.primaryText)
-                        Spacer()
-                        Picker("", selection: $nearbyRadiusKm) {
-                            Text("25 km").tag(25.0)
-                            Text("50 km").tag(50.0)
-                            Text("100 km").tag(100.0)
-                            Text("250 km").tag(250.0)
-                        }
-                        .pickerStyle(.menu)
-                        .tint(AppTheme.accent)
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    settingsDivider
-                    settingsToggle("Notify for nearby shows", isOn: $concertNotificationsEnabled)
-                }
-            }
-            .background(
-                RoundedRectangle(cornerRadius: 16, style: .continuous).fill(AppTheme.surface)
-            )
-            .padding(.horizontal, 20)
-
-            Text("Pulls show schedules from Bandsintown for tracked artists, including ~30 days of past dates. Tap a row to see the venue on a map and grab tickets.")
-                .font(.caption)
-                .foregroundStyle(AppTheme.secondary)
-                .padding(.horizontal, 24)
-        }
-    }
-
-    /// Geocode the manual city string and cache the result so the Nearby
-    /// filter can compare distances without needing CoreLocation.
-    private func geocodeManualCity() async {
-        let geocoder = CLGeocoder()
-        let trimmed = manualCityOverride.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        let placemarks = (try? await geocoder.geocodeAddressString(trimmed)) ?? []
-        guard let loc = placemarks.first?.location else { return }
-        let defaults = UserDefaults.standard
-        defaults.set(loc.coordinate.latitude, forKey: AppSettings.cachedLatitude)
-        defaults.set(loc.coordinate.longitude, forKey: AppSettings.cachedLongitude)
-        defaults.set(Date().timeIntervalSince1970, forKey: AppSettings.cachedLocationTimestamp)
-    }
-
     private var gesturesSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("GESTURES")
@@ -739,6 +592,35 @@ struct SettingsView: View {
         remixBadgeColorHex = AppSettings.defaultRemixBadgeColorHex
     }
 
+    /// A destructive action awaiting confirmation. These operations delete
+    /// SwiftData rows that CloudKit mirrors, so a mis-tap doesn't just wipe
+    /// this device — it propagates the deletion to every signed-in device,
+    /// with no undo. Previously each button fired the moment it was touched.
+    struct PendingDangerAction: Identifiable {
+        let id = UUID()
+        let title: String
+        let message: String
+        let confirmLabel: String
+        let perform: () -> Void
+    }
+
+    private func dangerButton(
+        _ title: String,
+        systemImage: String,
+        isDisabled: Bool = false,
+        confirmation: (message: String, confirmLabel: String),
+        action: @escaping () -> Void
+    ) -> some View {
+        dangerButton(title, systemImage: systemImage, isDisabled: isDisabled) {
+            pendingDangerAction = PendingDangerAction(
+                title: title,
+                message: confirmation.message,
+                confirmLabel: confirmation.confirmLabel,
+                perform: action
+            )
+        }
+    }
+
     private func dangerButton(_ title: String, systemImage: String, isDisabled: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack {
@@ -753,20 +635,6 @@ struct SettingsView: View {
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
-    }
-
-    private func labeled(_ title: String, value: String) -> some View {
-        HStack {
-            Text(title)
-                .font(.subheadline)
-                .foregroundStyle(AppTheme.primaryText)
-            Spacer()
-            Text(value)
-                .font(.subheadline)
-                .foregroundStyle(AppTheme.secondary)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
     }
 
     private var alertTimeBinding: Binding<Date> {
@@ -835,11 +703,29 @@ struct SettingsView: View {
     }
 
     @State private var iCloudAccountStatus: CKAccountStatus = .couldNotDetermine
+    @ObservedObject private var cloudSyncMonitor = CloudSyncMonitor.shared
 
-    private var iCloudOK: Bool { iCloudAccountStatus == .available }
+    /// The store fell back to local-only — the CloudKit container itself
+    /// couldn't be opened. Narrow but unambiguous.
+    private var isLocalOnlyDespiteAccount: Bool {
+        AppSchema.storeIsCloudKitBacked == false
+    }
+
+    /// The real mirroring verdict. `CKAccountStatus` being `.available` only
+    /// means an iCloud account exists — it does not mean this app's container
+    /// is reachable or that its schema has been deployed, which is precisely
+    /// the failure that leaves a shipped app silently not syncing.
+    private var cloudSyncError: String? {
+        cloudSyncMonitor.lastErrorDescription
+    }
+
+    private var iCloudOK: Bool {
+        iCloudAccountStatus == .available && !isLocalOnlyDespiteAccount
+    }
 
     private var iCloudIcon: String {
-        switch iCloudAccountStatus {
+        if isLocalOnlyDespiteAccount || cloudSyncError != nil { return "exclamationmark.icloud" }
+        return switch iCloudAccountStatus {
         case .available: "checkmark.icloud.fill"
         case .noAccount, .restricted, .temporarilyUnavailable: "xmark.icloud"
         case .couldNotDetermine: "icloud"
@@ -848,7 +734,9 @@ struct SettingsView: View {
     }
 
     private var iCloudHeadline: String {
-        switch iCloudAccountStatus {
+        if isLocalOnlyDespiteAccount { return "Not syncing — local only" }
+        if cloudSyncError != nil { return "iCloud sync failing" }
+        return switch iCloudAccountStatus {
         case .available: "Syncing"
         case .noAccount: "Not signed in to iCloud"
         case .restricted: "Restricted"
@@ -859,7 +747,13 @@ struct SettingsView: View {
     }
 
     private var iCloudSubtitle: String {
-        switch iCloudAccountStatus {
+        if isLocalOnlyDespiteAccount {
+            return "The iCloud container couldn't be opened, so your watchlist is stored only on this device."
+        }
+        if let cloudSyncError {
+            return cloudSyncError
+        }
+        return switch iCloudAccountStatus {
         case .available: "Your tracked artists and releases mirror across iPhone, iPad, and Mac."
         case .noAccount: "Sign in to iCloud in Settings to sync your watchlist across devices."
         case .restricted: "iCloud is restricted on this device (parental controls or MDM)."
@@ -1000,17 +894,40 @@ struct SettingsView: View {
         releasePreAlertDays = current.sorted().map(String.init).joined(separator: ",")
     }
 
+    /// Built as a `Menu` rather than a `Picker`, matching `preAlertPicker`
+    /// directly above it. A `.menu` Picker outside a Form/List drops its
+    /// label, so this row rendered as a lone centered "Albums & Singles" in
+    /// accent red with no indication of what it controlled — every other row
+    /// in the card is left-aligned label + right-aligned value.
     private var notificationTypePicker: some View {
-        Picker("Notify for", selection: $globalNotificationReleasePreference) {
-            Text("Albums & Singles").tag(ArtistNotificationPreference.all.rawValue)
-            Text("Albums Only").tag(ArtistNotificationPreference.albumsOnly.rawValue)
-            Text("Singles Only").tag(ArtistNotificationPreference.singlesOnly.rawValue)
+        Menu {
+            Picker("Notify for", selection: $globalNotificationReleasePreference) {
+                Text("Albums & Singles").tag(ArtistNotificationPreference.all.rawValue)
+                Text("Albums Only").tag(ArtistNotificationPreference.albumsOnly.rawValue)
+                Text("Singles Only").tag(ArtistNotificationPreference.singlesOnly.rawValue)
+            }
+        } label: {
+            HStack {
+                Text("Notify for")
+                    .foregroundStyle(AppTheme.primaryText)
+                Spacer()
+                Text(notificationTypeSummary)
+                    .foregroundStyle(AppTheme.secondary)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(AppTheme.secondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
         }
-        .pickerStyle(.menu)
-        .tint(AppTheme.accent)
-        .foregroundStyle(AppTheme.primaryText)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
+    }
+
+    private var notificationTypeSummary: String {
+        switch ArtistNotificationPreference(rawValue: globalNotificationReleasePreference) {
+        case .albumsOnly: "Albums Only"
+        case .singlesOnly: "Singles Only"
+        default: "Albums & Singles"
+        }
     }
 
     // MARK: - Appearance
@@ -1044,119 +961,6 @@ struct SettingsView: View {
                 .padding(.horizontal, 24)
         }
     }
-
-    // MARK: - Developer info
-
-    private var developerInfoSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(spacing: 0) {
-                Button {
-                    withAnimation { showingDeveloperInfo.toggle() }
-                } label: {
-                    HStack {
-                        Label("Developer info", systemImage: "wrench.and.screwdriver")
-                            .font(.subheadline)
-                            .foregroundStyle(AppTheme.primaryText)
-                        Spacer()
-                        Image(systemName: showingDeveloperInfo ? "chevron.up" : "chevron.down")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(AppTheme.secondary)
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                if showingDeveloperInfo {
-                    settingsDivider
-                    devTimestampRow("Last refresh", date: storedDate(AppSettings.lastRefreshAt))
-                    settingsDivider
-                    devTimestampRow("Last success", date: storedDate(AppSettings.lastSuccessfulRefreshAt))
-                    settingsDivider
-                    devTimestampRow("Last background", date: storedDate(AppSettings.lastBackgroundRefreshAt))
-                    settingsDivider
-                    devActionRow("Refetch all", systemImage: "arrow.clockwise") {
-                        refreshCoordinator.refresh(
-                            trackedArtists: trackedArtists,
-                            modelContext: modelContext,
-                            notificationHour: releaseNotificationHour,
-                            notificationMinute: releaseNotificationMinute
-                        )
-                        statusMessage = "Triggered refresh."
-                    }
-                    devActionRow("Schedule background refresh", systemImage: "clock.arrow.circlepath") {
-                        BackgroundRefreshScheduler.scheduleDailyRefresh()
-                        statusMessage = "Background refresh scheduled."
-                    }
-                    settingsDivider
-                    // Opens a searchable picker — a 60-item Menu was unusable
-                    // when the user's library was large. Tap → sheet with a
-                    // search field → tap an artist → runs the three fetch
-                    // paths and shows the report.
-                    devActionRow(isDiagnosing ? "Diagnosing…" : "Diagnose artist fetch",
-                                 systemImage: "stethoscope") {
-                        guard !trackedArtists.isEmpty, !isDiagnosing else { return }
-                        diagnosticPickerSearch = ""
-                        showingDiagnosticPicker = true
-                    }
-                    settingsDivider
-                    devActionRow("Debug: log diagnostics", systemImage: "ladybug") {
-                        let groupID = AppSettings.appGroupIdentifier
-                        let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID)
-                        Log.v("[Debug] appGroup=\(groupID) container=\(container?.path ?? "nil")")
-                        Log.v("[Debug] artists=\(artists.count) tracked=\(trackedArtists.count) releases=\(releases.count)")
-                        statusMessage = "Diagnostics logged to console."
-                    }
-                }
-            }
-            .background(
-                RoundedRectangle(cornerRadius: 16, style: .continuous).fill(AppTheme.surface)
-            )
-            .padding(.horizontal, 20)
-        }
-    }
-
-    private func devTimestampRow(_ title: String, date: Date?) -> some View {
-        HStack {
-            Text(title)
-                .font(.subheadline)
-                .foregroundStyle(AppTheme.primaryText)
-            Spacer()
-            Text(date.map { Self.relativeFormatter.localizedString(for: $0, relativeTo: Date()) } ?? "Never")
-                .font(.subheadline)
-                .foregroundStyle(AppTheme.secondary)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-    }
-
-    private func devActionRow(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack {
-                Label(title, systemImage: systemImage)
-                    .font(.subheadline)
-                    .foregroundStyle(AppTheme.accent)
-                Spacer()
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func storedDate(_ key: String) -> Date? {
-        let t = UserDefaults.standard.double(forKey: key)
-        guard t > 0 else { return nil }
-        return Date(timeIntervalSince1970: t)
-    }
-
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .short
-        return f
-    }()
 
     // MARK: - Actions
 

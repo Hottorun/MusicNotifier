@@ -65,6 +65,9 @@ struct Artists: View {
     @AppStorage("artistsLayout") private var artistsLayoutRaw: String = "list"
     @State private var importMode: ArtistImportMode = .all
     @State private var searchText = ""
+    /// Same trick Home uses — bind `.searchable` presentation so we can hide
+    /// the drawer on tab disappear instead of letting it stay revealed.
+    @State private var isSearchPresented = false
     @State private var artistSearchTerm = ""
     @State private var artistSearchResults: [ProviderArtistSearchResult] = []
     @State private var labelSearchResults: [LabelSearchResult] = []
@@ -95,7 +98,6 @@ struct Artists: View {
     @State private var selectedGenre: String? = nil
     @State private var scrubLetter: String? = nil
     @State private var lastScrubIndex: Int? = nil
-    @State private var gridSelectedArtist: ArtistData?
 
     private var trackedCount: Int { artists.filter(\.isTracked).count }
 
@@ -106,39 +108,6 @@ struct Artists: View {
         var hasUnseen = false
         var hasUpcoming = false
         var mostRecent: ReleaseData?
-    }
-
-    private var artistSummaries: [String: ArtistReleaseSummary] {
-        var map: [String: ArtistReleaseSummary] = [:]
-        for release in allReleases where release.dismissedAt == nil {
-            guard kindIsGloballyVisible(release.kind) else { continue }
-            var summary = map[release.artistProviderID] ?? ArtistReleaseSummary()
-            if release.isUpcoming { summary.hasUpcoming = true }
-            if !release.isSeen && release.isNewRelease { summary.hasUnseen = true }
-            // "Most recent" = most recent past release (released, not upcoming).
-            if !release.isUpcoming {
-                let candidateDate = release.releaseDate ?? release.firstSeenAt
-                if let existing = summary.mostRecent {
-                    let existingDate = existing.releaseDate ?? existing.firstSeenAt
-                    if candidateDate > existingDate { summary.mostRecent = release }
-                } else {
-                    summary.mostRecent = release
-                }
-            }
-            map[release.artistProviderID] = summary
-        }
-        return map
-    }
-
-    private func kindIsGloballyVisible(_ kind: ReleaseKind) -> Bool {
-        switch kind {
-        case .album: return showAlbums
-        case .single: return showSingles
-        case .ep: return showEPs
-        case .liveAlbum: return showLiveAlbums
-        case .compilation: return showCompilations
-        case .remix: return showRemixes
-        }
     }
 
     /// Memoized: previously computed-per-access, which walked all artists × all
@@ -154,40 +123,10 @@ struct Artists: View {
         if sorted != availableGenres { availableGenres = sorted }
     }
 
-    private var visibleArtists: [ArtistData] {
-        artists
-            .filter { artist in
-                switch listFilter {
-                case .all:
-                    true
-                case .tracked:
-                    artist.isTracked
-                case .untracked:
-                    !artist.isTracked
-                }
-            }
-            .filter { artist in
-                searchText.isEmpty || artist.name.localizedCaseInsensitiveContains(searchText)
-            }
-            .filter { artist in
-                guard let selectedGenre else { return true }
-                return artist.genres?.contains(selectedGenre) ?? false
-            }
-            .sorted { first, second in
-                switch sortOption {
-                case .name:
-                    first.name.localizedCaseInsensitiveCompare(second.name) == .orderedAscending
-                case .recentlyAdded:
-                    first.addedAt > second.addedAt
-                case .recentlyUpdated:
-                    (first.lastCheckedAt ?? .distantPast) > (second.lastCheckedAt ?? .distantPast)
-                }
-            }
-    }
-
-    /// Memoized snapshot computed once per body render. Hot computed properties
-    /// (`visibleArtists`, `sectionLetters`, `letterIndex`) used to each walk the
-    /// full artist list independently; this batches them into a single pass.
+    /// Memoized snapshot of the artist list. The filter/sort/section-letter
+    /// walk and the per-artist release summary each used to be a separate
+    /// computed property re-evaluated on every render; they're batched into a
+    /// single pass in `computeSnapshotIDs`, which runs off the main actor.
     private struct ArtistsSnapshot {
         var visible: [ArtistData] = []
         var sectionLetters: [String] = []
@@ -201,6 +140,9 @@ struct Artists: View {
     /// refresh, because SwiftData `@Query` invalidations forced a full re-walk
     /// on every save. The walk now runs in `.task(id:)` after the frame paints.
     @State private var cachedSnapshot = ArtistsSnapshot()
+    /// Gates the debounce in `.task(id:)` — the first walk runs immediately so
+    /// the grid isn't empty on appear; later ones coalesce.
+    @State private var hasComputedSnapshotOnce = false
 
     private struct ArtistsSnapshotKey: Hashable {
         var artistCount: Int
@@ -234,32 +176,235 @@ struct Artists: View {
         )
     }
 
-    private func makeSnapshot() -> ArtistsSnapshot {
-        let visible = visibleArtists
-        var letters: [String] = []
-        var lettersSet: Set<String> = []
-        var index: [String: String] = [:]
-        for artist in visible {
-            let key = letterKey(for: artist.name)
-            if !lettersSet.contains(key) {
-                lettersSet.insert(key)
-                letters.append(key)
-            }
-            if index[key] == nil { index[key] = artist.providerID }
-        }
-        return ArtistsSnapshot(
-            visible: visible,
-            sectionLetters: letters,
-            letterIndex: index,
-            summaries: artistSummaries
-        )
+    // MARK: - Off-main snapshot
+
+    /// Sendable projection of an `ArtistData` row — only the fields the
+    /// filter/sort/section walk reads.
+    private struct ArtistProjection: Sendable {
+        let id: PersistentIdentifier
+        let providerID: String
+        let name: String
+        let isTracked: Bool
+        let genres: [String]
+        let addedAt: Date
+        let lastCheckedAt: Date?
     }
 
-    private func letterKey(for name: String) -> String {
+    /// Sendable projection of a `ReleaseData` row for the summary walk. The
+    /// day classification is resolved here (once, from cached day boundaries)
+    /// so the off-main pass never touches `Calendar`.
+    private struct ReleaseProjection: Sendable {
+        let id: PersistentIdentifier
+        let artistProviderID: String
+        let kind: ReleaseKind
+        let isSeen: Bool
+        let isUpcoming: Bool
+        let isNewRelease: Bool
+        let sortDate: Date
+    }
+
+    /// Result of the off-main walk. Carries IDs, not model references, so it
+    /// can cross the actor boundary; `resolve` turns them back into models.
+    private struct SnapshotIDs: Sendable {
+        var visibleIDs: [PersistentIdentifier] = []
+        var sectionLetters: [String] = []
+        var letterIndex: [String: String] = [:]
+        var summaries: [String: SummaryIDs] = [:]
+    }
+
+    private struct SummaryIDs: Sendable {
+        var hasUnseen = false
+        var hasUpcoming = false
+        var mostRecentID: PersistentIdentifier?
+        var mostRecentDate: Date?
+    }
+
+    /// Single MainActor pass over both tables, producing Sendable projections
+    /// plus the ID→model lookups needed to resolve the result.
+    ///
+    /// Everything below this point used to run on the main thread: `.task(id:)`
+    /// closures inherit the view's MainActor isolation, so the old
+    /// `let next = makeSnapshot(); await MainActor.run { … }` did the entire
+    /// artists × releases walk on main and the `MainActor.run` hop was a no-op.
+    /// It was merely deferred by a frame, not moved off — so every SwiftData
+    /// save during a fetch still stalled scrolling.
+    private func projectInputs() -> (
+        artists: [ArtistProjection],
+        releases: [ReleaseProjection],
+        artistLookup: [PersistentIdentifier: ArtistData],
+        releaseLookup: [PersistentIdentifier: ReleaseData]
+    ) {
+        var artistProjections: [ArtistProjection] = []
+        artistProjections.reserveCapacity(artists.count)
+        var artistLookup: [PersistentIdentifier: ArtistData] = [:]
+        artistLookup.reserveCapacity(artists.count)
+        for artist in artists {
+            let id = artist.persistentModelID
+            artistProjections.append(
+                ArtistProjection(
+                    id: id,
+                    providerID: artist.providerID,
+                    name: artist.name,
+                    isTracked: artist.isTracked,
+                    genres: artist.genres ?? [],
+                    addedAt: artist.addedAt,
+                    lastCheckedAt: artist.lastCheckedAt
+                )
+            )
+            if artistLookup[id] == nil { artistLookup[id] = artist }
+        }
+
+        let day = ReleaseDayBoundaries.snapshot()
+        var releaseProjections: [ReleaseProjection] = []
+        releaseProjections.reserveCapacity(allReleases.count)
+        var releaseLookup: [PersistentIdentifier: ReleaseData] = [:]
+        releaseLookup.reserveCapacity(allReleases.count)
+        for release in allReleases where release.dismissedAt == nil {
+            let id = release.persistentModelID
+            let releaseDate = release.releaseDate
+            let isUpcoming = releaseDate.map { $0 >= day.startOfTomorrow } ?? false
+            let isNew = releaseDate.map {
+                $0 < day.startOfTomorrow && $0 >= day.newReleaseCutoff
+            } ?? false
+            releaseProjections.append(
+                ReleaseProjection(
+                    id: id,
+                    artistProviderID: release.artistProviderID,
+                    kind: release.kind,
+                    isSeen: release.isSeen,
+                    isUpcoming: isUpcoming,
+                    isNewRelease: isNew,
+                    sortDate: releaseDate ?? release.firstSeenAt
+                )
+            )
+            if releaseLookup[id] == nil { releaseLookup[id] = release }
+        }
+        return (artistProjections, releaseProjections, artistLookup, releaseLookup)
+    }
+
+    /// Pure value-type walk — safe on any executor. Mirrors `visibleArtists`,
+    /// the section-letter pass, and `artistSummaries` in a single function.
+    nonisolated private static func computeSnapshotIDs(
+        artists: [ArtistProjection],
+        releases: [ReleaseProjection],
+        listFilter: ArtistListFilter,
+        searchText: String,
+        selectedGenre: String?,
+        sortOption: ArtistSortOption,
+        visibleKinds: Set<ReleaseKind>
+    ) -> SnapshotIDs {
+        var out = SnapshotIDs()
+
+        var visible = artists.filter { artist in
+            switch listFilter {
+            case .all: break
+            case .tracked: if !artist.isTracked { return false }
+            case .untracked: if artist.isTracked { return false }
+            }
+            if !searchText.isEmpty, !artist.name.localizedCaseInsensitiveContains(searchText) {
+                return false
+            }
+            if let selectedGenre, !artist.genres.contains(selectedGenre) { return false }
+            return true
+        }
+        visible.sort { first, second in
+            switch sortOption {
+            case .name:
+                first.name.localizedCaseInsensitiveCompare(second.name) == .orderedAscending
+            case .recentlyAdded:
+                first.addedAt > second.addedAt
+            case .recentlyUpdated:
+                (first.lastCheckedAt ?? .distantPast) > (second.lastCheckedAt ?? .distantPast)
+            }
+        }
+
+        var lettersSet: Set<String> = []
+        for artist in visible {
+            let key = Self.letterKeyStatic(for: artist.name)
+            if !lettersSet.contains(key) {
+                lettersSet.insert(key)
+                out.sectionLetters.append(key)
+            }
+            if out.letterIndex[key] == nil { out.letterIndex[key] = artist.providerID }
+        }
+        out.visibleIDs = visible.map(\.id)
+
+        for release in releases {
+            guard visibleKinds.contains(release.kind) else { continue }
+            var summary = out.summaries[release.artistProviderID] ?? SummaryIDs()
+            if release.isUpcoming { summary.hasUpcoming = true }
+            if !release.isSeen && release.isNewRelease { summary.hasUnseen = true }
+            // "Most recent" = most recent past release (released, not upcoming).
+            if !release.isUpcoming {
+                if let existing = summary.mostRecentDate {
+                    if release.sortDate > existing {
+                        summary.mostRecentID = release.id
+                        summary.mostRecentDate = release.sortDate
+                    }
+                } else {
+                    summary.mostRecentID = release.id
+                    summary.mostRecentDate = release.sortDate
+                }
+            }
+            out.summaries[release.artistProviderID] = summary
+        }
+        return out
+    }
+
+    nonisolated private static func letterKeyStatic(for name: String) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard let first = trimmed.first else { return "#" }
         if first.isLetter { return String(first).uppercased() }
         return "#"
+    }
+
+    private func visibleKindsSet() -> Set<ReleaseKind> {
+        var kinds: Set<ReleaseKind> = []
+        if showAlbums { kinds.insert(.album) }
+        if showSingles { kinds.insert(.single) }
+        if showEPs { kinds.insert(.ep) }
+        if showLiveAlbums { kinds.insert(.liveAlbum) }
+        if showCompilations { kinds.insert(.compilation) }
+        if showRemixes { kinds.insert(.remix) }
+        return kinds
+    }
+
+    /// Projects on main, walks off-main, resolves back on main.
+    private func makeSnapshotAsync() async -> ArtistsSnapshot {
+        let (artistProjections, releaseProjections, artistLookup, releaseLookup) = projectInputs()
+        let filter = listFilter
+        let search = searchText
+        let genre = selectedGenre
+        let sort = sortOption
+        let kinds = visibleKindsSet()
+
+        let ids = await Task.detached(priority: .userInitiated) {
+            Self.computeSnapshotIDs(
+                artists: artistProjections,
+                releases: releaseProjections,
+                listFilter: filter,
+                searchText: search,
+                selectedGenre: genre,
+                sortOption: sort,
+                visibleKinds: kinds
+            )
+        }.value
+
+        var summaries: [String: ArtistReleaseSummary] = [:]
+        summaries.reserveCapacity(ids.summaries.count)
+        for (providerID, summary) in ids.summaries {
+            summaries[providerID] = ArtistReleaseSummary(
+                hasUnseen: summary.hasUnseen,
+                hasUpcoming: summary.hasUpcoming,
+                mostRecent: summary.mostRecentID.flatMap { releaseLookup[$0] }
+            )
+        }
+        return ArtistsSnapshot(
+            visible: ids.visibleIDs.compactMap { artistLookup[$0] },
+            sectionLetters: ids.sectionLetters,
+            letterIndex: ids.letterIndex,
+            summaries: summaries
+        )
     }
 
     var body: some View {
@@ -278,16 +423,36 @@ struct Artists: View {
                     }
                 }
             }
-            // Single destination shared by both grid + (potentially) other state-driven
-            // pushes. Inside NavigationStack so it lives in the same nav tree.
-            .navigationDestination(item: $gridSelectedArtist) { artist in
+            // Both destinations are value-based and registered here at the
+            // stack root. Do NOT reintroduce `.navigationDestination(item:)`
+            // for artists: that modifier keeps its destination presented for
+            // as long as the bound item is non-nil, so once a value-based push
+            // (AlbumView) landed on top, SwiftUI re-resolved the still-non-nil
+            // binding and pushed ArtistDetailView *again* above the album —
+            // the "album opens, then the artist page reopens on top of it" bug.
+            // Mixing the two styles in one stack is what breaks; keeping every
+            // push value-based lets the stack own its own order.
+            .navigationDestination(for: ArtistData.self) { artist in
                 ArtistDetailView(artist: artist)
+            }
+            .navigationDestination(for: ReleaseData.self) { release in
+                AlbumView(release: release)
             }
             // Deferred derivation. Walking the full release table + artist list
             // synchronously in body was blocking tab switches during refresh.
             .task(id: artistsSnapshotKey) {
-                let next = makeSnapshot()
-                await MainActor.run { cachedSnapshot = next }
+                // Debounce after the first walk. A refresh commits a SwiftData
+                // batch every few seconds; each commit changes `releaseCount`
+                // → new key → this task restarts, cancelling the in-flight
+                // run. Sleeping first means a burst of saves costs one walk.
+                if hasComputedSnapshotOnce {
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    if Task.isCancelled { return }
+                }
+                let next = await makeSnapshotAsync()
+                if Task.isCancelled { return }
+                cachedSnapshot = next
+                hasComputedSnapshotOnce = true
             }
         }
     }
@@ -366,7 +531,6 @@ struct Artists: View {
             return List {
                 Group {
                     header
-                    filterRow
                     genreBulkActionBar
 
                     if let importMessage {
@@ -397,7 +561,14 @@ struct Artists: View {
                         ForEach(visibleArtists, id: \.providerID) { artist in
                             artistRow(artist)
                                 .background(
-                                    NavigationLink("", destination: ArtistDetailView(artist: artist))
+                                    // Value-based, matching the grid. The old
+                                    // `NavigationLink(destination:)` form both
+                                    // mixed navigation styles within this stack
+                                    // and eagerly built an `ArtistDetailView`
+                                    // per row — and that initializer opens a
+                                    // `@Query` plus reads the Last.fm disk
+                                    // cache, so it ran for every visible row.
+                                    NavigationLink("", value: artist)
                                         .opacity(0)
                                 )
                                 .id(artist.providerID)
@@ -439,7 +610,11 @@ struct Artists: View {
                 }
             }
             .appScreenBackground()
-            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search artists")
+            .searchable(text: $searchText, isPresented: $isSearchPresented, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search artists")
+            .onDisappear {
+                isSearchPresented = false
+                searchText = ""
+            }
             .onAppear { refreshAvailableGenres() }
             .onChange(of: artists.count) { _, _ in refreshAvailableGenres() }
             .task {
@@ -454,16 +629,26 @@ struct Artists: View {
             .sheet(isPresented: $showingImportSheet) {
                 importSheet
             }
-            .sheet(isPresented: $showingSearchSheet) {
+            // Reset on dismiss — reopening the sheet used to come back with
+            // the previous query still typed in, its results below it, and a
+            // stale "Imported and tracking X." line from the last session.
+            .sheet(isPresented: $showingSearchSheet, onDismiss: {
+                searchTask?.cancel()
+                searchTask = nil
+                artistSearchTerm = ""
+                artistSearchResults = []
+                labelSearchResults = []
+                importMessage = nil
+            }) {
                 searchSheet
             }
     }
 
     private var header: some View {
-        // Title moved into the native nav bar so it collapses to a small pill
-        // on scroll (matches Videos). This row just holds the tracked-count
-        // filter chip.
-        HStack(alignment: .center, spacing: 12) {
+        // Tracked-count pill + genre / layout / sort controls share one row so
+        // the user reads the stat and the available filters at the same eye
+        // level (previously the filter cluster sat on its own line below).
+        HStack(alignment: .center, spacing: 7) {
             // Plain text with simultaneousGesture — inside a List row,
             // Button/onTapGesture get swallowed by the row's hit region,
             // but a simultaneousGesture fires alongside the row's gesture.
@@ -486,9 +671,82 @@ struct Artists: View {
                                     : "\(trackedCount) of \(artists.count) tracked. Tap to filter to untracked.")
 
             Spacer(minLength: 8)
+
+            filterControls
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 18)
+    }
+
+    /// Genre / layout / sort buttons. Previously the body of `filterRow`;
+    /// extracted so the same cluster can live inline with the tracked-count
+    /// pill in `header` without duplicating the menu definitions.
+    @ViewBuilder
+    private var filterControls: some View {
+        if !availableGenres.isEmpty {
+            Menu {
+                Button {
+                    selectedGenre = nil
+                } label: {
+                    Label("All genres", systemImage: selectedGenre == nil ? "checkmark" : "")
+                }
+                Divider()
+                ForEach(availableGenres, id: \.self) { genre in
+                    Button {
+                        selectedGenre = genre
+                    } label: {
+                        Label(genre, systemImage: selectedGenre == genre ? "checkmark" : "")
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: selectedGenre == nil ? "guitars" : "guitars.fill")
+                        .font(.footnote.weight(.semibold))
+                    if let selectedGenre {
+                        Text(selectedGenre)
+                            .font(.footnote.weight(.semibold))
+                            .lineLimit(1)
+                    }
+                }
+                .foregroundStyle(selectedGenre == nil ? AppTheme.secondary : AppTheme.accent)
+                .padding(.horizontal, 10)
+                .frame(height: 30)
+                .background(Capsule().fill(selectedGenre == nil ? AppTheme.surface : AppTheme.accentSoft))
+            }
+        }
+
+        Button {
+            artistsLayoutRaw = (artistsLayoutRaw == "grid" ? "list" : "grid")
+        } label: {
+            Image(systemName: artistsLayoutRaw == "grid" ? "square.grid.3x3.fill" : "list.bullet")
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(AppTheme.surface))
+                .foregroundStyle(AppTheme.secondary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(artistsLayoutRaw == "grid" ? "Switch to list" : "Switch to grid")
+
+        Menu {
+            Picker("Show", selection: $listFilter) {
+                Label("All artists", systemImage: "person.2").tag(ArtistListFilter.all)
+                Label("Tracked", systemImage: "bell.fill").tag(ArtistListFilter.tracked)
+                Label("Untracked", systemImage: "bell.slash").tag(ArtistListFilter.untracked)
+            }
+            Divider()
+            Picker("Sort", selection: $sortOption) {
+                Label("A-Z", systemImage: "textformat").tag(ArtistSortOption.name)
+                Label("Recently added", systemImage: "clock").tag(ArtistSortOption.recentlyAdded)
+                Label("Recently checked", systemImage: "checkmark.circle").tag(ArtistSortOption.recentlyUpdated)
+            }
+        } label: {
+            let nonDefaultFilter = listFilter != .all
+            Image(systemName: nonDefaultFilter ? "line.3.horizontal.decrease.circle.fill" : "arrow.up.arrow.down")
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(nonDefaultFilter ? AppTheme.accentSoft : AppTheme.surface))
+                .foregroundStyle(nonDefaultFilter ? AppTheme.accent : AppTheme.secondary)
+        }
     }
 
     /// Search / add buttons, rendered inline at the right of the "Artists"
@@ -593,83 +851,6 @@ struct Artists: View {
         .padding(.horizontal, 18)
     }
 
-    private var filterRow: some View {
-        HStack(spacing: 7) {
-            Spacer()
-
-            // Genre filter — only shown if any artist has at least one genre.
-            if !availableGenres.isEmpty {
-                Menu {
-                    Button {
-                        selectedGenre = nil
-                    } label: {
-                        Label("All genres", systemImage: selectedGenre == nil ? "checkmark" : "")
-                    }
-                    Divider()
-                    ForEach(availableGenres, id: \.self) { genre in
-                        Button {
-                            selectedGenre = genre
-                        } label: {
-                            Label(genre, systemImage: selectedGenre == genre ? "checkmark" : "")
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: selectedGenre == nil ? "guitars" : "guitars.fill")
-                            .font(.footnote.weight(.semibold))
-                        if let selectedGenre {
-                            Text(selectedGenre)
-                                .font(.footnote.weight(.semibold))
-                                .lineLimit(1)
-                        }
-                    }
-                    .foregroundStyle(selectedGenre == nil ? AppTheme.secondary : AppTheme.accent)
-                    .padding(.horizontal, 10)
-                    .frame(height: 30)
-                    .background(Capsule().fill(selectedGenre == nil ? AppTheme.surface : AppTheme.accentSoft))
-                }
-            }
-
-            Button {
-                // Drop the animation: flipping the layout makes every artist row /
-                // tile re-position, which the system-default transition handles fine
-                // without an explicit eased timing that the whole list has to follow.
-                artistsLayoutRaw = (artistsLayoutRaw == "grid" ? "list" : "grid")
-            } label: {
-                Image(systemName: artistsLayoutRaw == "grid" ? "square.grid.3x3.fill" : "list.bullet")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(width: 34, height: 34)
-                    .background(Circle().fill(AppTheme.surface))
-                    .foregroundStyle(AppTheme.secondary)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(artistsLayoutRaw == "grid" ? "Switch to list" : "Switch to grid")
-
-            Menu {
-                Picker("Show", selection: $listFilter) {
-                    Label("All artists", systemImage: "person.2").tag(ArtistListFilter.all)
-                    Label("Tracked", systemImage: "bell.fill").tag(ArtistListFilter.tracked)
-                    Label("Untracked", systemImage: "bell.slash").tag(ArtistListFilter.untracked)
-                }
-                Divider()
-                Picker("Sort", selection: $sortOption) {
-                    Label("A-Z", systemImage: "textformat").tag(ArtistSortOption.name)
-                    Label("Recently added", systemImage: "clock").tag(ArtistSortOption.recentlyAdded)
-                    Label("Recently checked", systemImage: "checkmark.circle").tag(ArtistSortOption.recentlyUpdated)
-                }
-            } label: {
-                // Tint accent when a non-default filter is active so the user
-                // sees at a glance whether the list is being narrowed.
-                let nonDefaultFilter = listFilter != .all
-                Image(systemName: nonDefaultFilter ? "line.3.horizontal.decrease.circle.fill" : "arrow.up.arrow.down")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(width: 34, height: 34)
-                    .background(Circle().fill(nonDefaultFilter ? AppTheme.accentSoft : AppTheme.surface))
-                    .foregroundStyle(nonDefaultFilter ? AppTheme.accent : AppTheme.secondary)
-            }
-        }
-        .padding(.horizontal, 18)
-    }
 
     private func artistsGrid(visibleArtists: [ArtistData]) -> some View {
         let columns = [
@@ -685,7 +866,6 @@ struct Artists: View {
             ForEach(visibleArtists, id: \.providerID) { artist in
                 ArtistGridCell(
                     artist: artist,
-                    onSelect: { gridSelectedArtist = artist },
                     tile: { artistGridTile(artist, summary: summaries[artist.providerID]) }
                 )
                 .id(artist.providerID)
@@ -975,6 +1155,28 @@ struct Artists: View {
                 .font(.footnote)
                 .foregroundStyle(AppTheme.secondary)
                 .multilineTextAlignment(.center)
+
+            // The only way out of the empty list used to be the small "+"
+            // menu in the toolbar. Put the two actions the copy describes
+            // right where the user is looking.
+            if artists.isEmpty {
+                HStack(spacing: 10) {
+                    Button {
+                        showingImportSheet = true
+                    } label: {
+                        Label("Import library", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+
+                    Button {
+                        showingSearchSheet = true
+                    } label: {
+                        Label("Search", systemImage: "magnifyingglass")
+                    }
+                    .buttonStyle(GhostButtonStyle())
+                }
+                .padding(.top, 6)
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 48)
@@ -1014,13 +1216,16 @@ struct Artists: View {
                 artist.isTracked.toggle()
                 try? modelContext.save()
             } label: {
+                // Tracked reads as accent-on-accentSoft. The previous
+                // `.white` on `elevatedSurface` was white-on-light-grey in
+                // light mode, so a tracked artist looked *untracked*.
                 Image(systemName: artist.isTracked ? "bell.fill" : "bell")
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(artist.isTracked ? .white : AppTheme.secondary)
+                    .foregroundStyle(artist.isTracked ? AppTheme.accent : AppTheme.secondary)
                     .frame(width: 36, height: 36)
                     .background(
                         Circle()
-                            .fill(AppTheme.elevatedSurface)
+                            .fill(artist.isTracked ? AppTheme.accentSoft : AppTheme.elevatedSurface)
                     )
             }
             .buttonStyle(.plain)
@@ -1644,15 +1849,19 @@ struct Artists: View {
 /// actually pressed.
 fileprivate struct ArtistGridCell<Tile: View>: View {
     let artist: ArtistData
-    let onSelect: () -> Void
     @ViewBuilder var tile: () -> Tile
 
     var body: some View {
         // No contextMenu in grid mode — the menu's default snapshot lifts the
         // entire grid as a tiny preview, which is jarring. Long-press actions
         // are still available in the list view.
-        tile()
-            .contentShape(Rectangle())
-            .onTapGesture(perform: onSelect)
+        //
+        // Value-based link rather than a tap handler writing to a
+        // `navigationDestination(item:)` binding — see the note on the stack
+        // root in `Artists.body`.
+        NavigationLink(value: artist) {
+            tile()
+        }
+        .buttonStyle(.plain)
     }
 }

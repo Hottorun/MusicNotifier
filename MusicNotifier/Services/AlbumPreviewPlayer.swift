@@ -21,7 +21,34 @@ final class AlbumPreviewPlayer: ObservableObject {
     }
 
     @Published private(set) var state: State = .idle
+
+    /// Human-readable failure from the last playback attempt, or `nil`.
+    /// `play(...)` has always set `state = .error(...)` on failure, but no
+    /// view ever rendered that case — so a Play tap that MusicKit rejected
+    /// (no Apple Music subscription, region-locked album, playback
+    /// unavailable) looked like a dead button. Views observe this to show it.
+    var errorMessage: String? {
+        if case .error(let message) = state { return message }
+        return nil
+    }
+
+    /// Clears a surfaced error back to idle once the user has dismissed it,
+    /// so the next Play attempt starts from a clean state.
+    func clearError() {
+        if case .error = state { state = .idle }
+    }
+
     @Published private(set) var currentTrackTitle: String?
+    /// Provider ID of the album currently in the queue. Drives the global
+    /// mini-player's tap-to-jump-back deep link — without this, the bar
+    /// would have no way to know which AlbumView to push the user into.
+    @Published private(set) var currentAlbumProviderID: String?
+    /// Album-level metadata cached on the player so the global mini-player
+    /// can render without reading any AlbumView state — without these, the
+    /// bar would have no artwork / artist name to show once the user
+    /// navigates away from the source album.
+    @Published private(set) var currentArtistName: String?
+    @Published private(set) var currentArtworkURL: URL?
 
     private let player = ApplicationMusicPlayer.shared
     private var stateObserver: AnyCancellable?
@@ -88,13 +115,33 @@ final class AlbumPreviewPlayer: ObservableObject {
                 state = .error("Album not found.")
                 return
             }
+            // Hydrate the duration cache before queuing playback so the
+            // global mini-player has duration data immediately for the
+            // first track that starts playing.
+            let detailed = (try? await album.with([.tracks])) ?? album
+            cacheTrackDurations(detailed.tracks ?? MusicItemCollection<Track>())
             player.queue = ApplicationMusicPlayer.Queue(for: [album])
             try await player.play()
             state = .playing
             currentTrackTitle = player.queue.currentEntry?.title
+            currentAlbumProviderID = albumProviderID
+            currentArtistName = album.artistName
+            currentArtworkURL = album.artwork?.url(width: 200, height: 200)
         } catch {
-            state = .error(error.localizedDescription)
+            state = .error(await Self.playbackFailureMessage(error))
         }
+    }
+
+    /// Build the title→duration lookup the mini-player falls back on when
+    /// MusicKit's queue entry item refuses to cast to a typed model.
+    private func cacheTrackDurations(_ tracks: MusicItemCollection<Track>) {
+        var map: [String: TimeInterval] = [:]
+        for track in tracks {
+            if let duration = track.duration {
+                map[track.title] = duration
+            }
+        }
+        cachedTrackDurations = map
     }
 
     /// Start playback at a specific track within the album.
@@ -117,19 +164,26 @@ final class AlbumPreviewPlayer: ObservableObject {
             }
             let detailed = try await album.with([.tracks])
             let tracks = detailed.tracks ?? MusicItemCollection<Track>()
+            cacheTrackDurations(tracks)
             guard let startTrack = tracks.first(where: { $0.id.rawValue == trackID }) else {
                 player.queue = ApplicationMusicPlayer.Queue(for: [album])
                 try await player.play()
                 state = .playing
                 currentTrackTitle = player.queue.currentEntry?.title
+                currentAlbumProviderID = albumProviderID
+                currentArtistName = album.artistName
+                currentArtworkURL = album.artwork?.url(width: 200, height: 200)
                 return
             }
             player.queue = ApplicationMusicPlayer.Queue(for: tracks, startingAt: startTrack)
             try await player.play()
             state = .playing
             currentTrackTitle = player.queue.currentEntry?.title
+            currentAlbumProviderID = albumProviderID
+            currentArtistName = album.artistName
+            currentArtworkURL = album.artwork?.url(width: 200, height: 200)
         } catch {
-            state = .error(error.localizedDescription)
+            state = .error(await Self.playbackFailureMessage(error))
         }
     }
 
@@ -161,6 +215,22 @@ final class AlbumPreviewPlayer: ObservableObject {
         #endif
     }
 
+    /// Turn a MusicKit playback failure into copy a user can act on.
+    /// `error.localizedDescription` for these is developer-facing noise —
+    /// "The operation couldn't be completed. (MPMusicPlayerControllerErrorDomain
+    /// error 6.)" — which is what the Play button surfaced before.
+    ///
+    /// By far the most common real cause is simply not having an Apple Music
+    /// subscription, so that is checked explicitly rather than lumped into a
+    /// generic failure.
+    private static func playbackFailureMessage(_ error: Error) async -> String {
+        if let subscription = try? await MusicSubscription.current,
+           !subscription.canPlayCatalogContent {
+            return "Playing full tracks requires an Apple Music subscription. You can still open this release in Apple Music."
+        }
+        return "This release can't be played right now — it may not be available in your region, or Apple Music is temporarily unreachable."
+    }
+
     func pause() {
         player.pause()
         state = .paused
@@ -171,7 +241,7 @@ final class AlbumPreviewPlayer: ObservableObject {
             try await player.play()
             state = .playing
         } catch {
-            state = .error(error.localizedDescription)
+            state = .error(await Self.playbackFailureMessage(error))
         }
     }
 
@@ -191,6 +261,10 @@ final class AlbumPreviewPlayer: ObservableObject {
         suppressObserver = true
         state = .idle
         currentTrackTitle = nil
+        currentAlbumProviderID = nil
+        currentArtistName = nil
+        currentArtworkURL = nil
+        cachedTrackDurations = [:]
         stopTitlePolling()
         player.stop()
         restoreSystemPlayerIfNeeded()
@@ -270,10 +344,22 @@ final class AlbumPreviewPlayer: ObservableObject {
         player.playbackTime = max(0, time)
     }
 
+    /// Cache: track title → duration. Built when an album is queued for
+    /// playback so the global mini-player has a duration to render the
+    /// progress strip against even when MusicKit's queue entry item
+    /// doesn't cast cleanly to a typed `Song` / `MusicVideo` (which it
+    /// often doesn't — see the existing AlbumView fallback that read the
+    /// duration from its locally-loaded tracks array).
+    private var cachedTrackDurations: [String: TimeInterval] = [:]
+
     /// Duration of the currently playing item if it can be extracted from the queue.
     var currentTrackDuration: TimeInterval? {
         if let song = player.queue.currentEntry?.item as? Song { return song.duration }
         if let video = player.queue.currentEntry?.item as? MusicVideo { return video.duration }
+        if let title = player.queue.currentEntry?.title,
+           let cached = cachedTrackDurations[title] {
+            return cached
+        }
         return nil
     }
 }

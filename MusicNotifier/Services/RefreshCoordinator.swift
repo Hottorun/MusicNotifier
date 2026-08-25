@@ -89,10 +89,24 @@ final class RefreshCoordinator {
             self.message = "Refresh timed out after \(Int(timeout / 60)) min — try again."
         }
 
+        // Captured on main: the ModelContainer the streaming upsert actor
+        // uses to write releases off-main during the task group. SwiftData
+        // mirrors actor writes back to this same container's main context,
+        // so `@Query` on Home fires per batch and the feed fills in live.
+        let modelContainer = modelContext.container
+
         // Detached, .userInitiated — runs on cooperative pool, fully independent of any
         // SwiftUI view lifecycle. The fetch loop is therefore not affected by tab switches.
         task = Task.detached(priority: .userInitiated) { [weak self] in
             Log.v("[Refresh] detached task started, inputs=\(inputs.count)")
+
+            // Auth gate. If a refresh kicks off at launch (auto-refresh) before
+            // `verifyMusicLibraryAccess` finishes its `MusicAuthorization.request`,
+            // the pre-resolve / storefront / album calls all fire while status
+            // is `.notDetermined` and silently fall back to a Locale storefront.
+            // Block here until the user has actually granted (or denied) access.
+            await Self.awaitMusicAuthorizationResolved()
+
             let warmupStart = Date()
             await Self.warmUpMusicKitIdentity(timeout: 8)
             Log.v("[Refresh] warmup done in \(String(format: "%.2f", Date().timeIntervalSince(warmupStart)))s")
@@ -100,35 +114,43 @@ final class RefreshCoordinator {
             let appleService = AppleMusicReleaseService()
             let spotifyService = SpotifyService()
 
-            // Compute incremental-fetch window from the last successful refresh.
-            // First refresh ever → nil (full default window). Otherwise pass
-            // days-since-last-refresh; the service tacks on a 3-day buffer.
+            // Fetch window is fixed, not incremental: a refresh only ever
+            // pulls releases from the last `ReleaseRecencyGate.windowDays`
+            // days (plus anything future-dated). The old behaviour widened
+            // the window to "everything since the last successful refresh"
+            // — and to "since Jan 1" on a first run — which is why stale
+            // back-catalog kept landing in the feed. `isFirstRefresh` is
+            // still tracked, but only to decide whether to retry a failed
+            // artist fetch.
             let lastSuccess = UserDefaults.standard.double(forKey: AppSettings.lastSuccessfulRefreshAt)
-            let daysSinceLastRefresh: Int? = {
-                guard lastSuccess > 0 else { return nil }
-                let elapsedSeconds = Date().timeIntervalSince1970 - lastSuccess
-                guard elapsedSeconds > 0 else { return nil }
-                return max(1, Int(elapsedSeconds / 86_400))
-            }()
-            if let days = daysSinceLastRefresh {
-                Log.v("[Refresh] incremental window: \(days) days since last refresh")
-            } else {
-                Log.v("[Refresh] first refresh — using full default window")
-            }
+            let isFirstRefresh = lastSuccess <= 0
+            Log.v("[Refresh] window: last \(ReleaseRecencyGate.windowDays) days (firstRefresh=\(isFirstRefresh))")
 
-            // Kick off videos + concerts fetches in parallel with releases so the
-            // network legs overlap. They were previously sequential (videos after
-            // releases, then concerts after videos), which left the progress bar
-            // sitting on indeterminate spinners for the whole tail of the refresh.
+            // Kick off the videos fetch in parallel with releases so the network
+            // legs overlap. It was previously sequential (videos after releases),
+            // which left the progress bar sitting on an indeterminate spinner for
+            // the whole tail of the refresh.
             let videosEnabled = UserDefaults.standard.object(forKey: AppSettings.enableVideosTab) as? Bool ?? false
-            let concertsEnabled = UserDefaults.standard.object(forKey: AppSettings.enableConcertsTab) as? Bool ?? false
             let videoInputs = videosEnabled ? inputs.filter { $0.kind != "label" } : []
             async let videoFetchTask: [FetchedVideo] = videosEnabled
                 ? AppleMusicVideoService().fetchVideos(for: videoInputs)
                 : []
-            async let concertFetchTask: [FetchedConcert] = concertsEnabled
-                ? BandsintownService().fetchConcerts(for: inputs)
-                : []
+
+            // Advance phase out of `.warming` before pre-resolve so the UI
+            // shows "Checking releases" instead of "Connecting to Apple
+            // Music" while we batch-resolve. Pre-resolve hits the same
+            // network/itunescloudd path that's saturated during CloudKit
+            // hydration, so it can take noticeably longer than warmup on a
+            // fresh install.
+            await MainActor.run { [weak self] in
+                self?.progress = ReleaseRefreshProgress(
+                    checkedArtists: 0,
+                    totalArtists: totalCount,
+                    currentArtistName: "Starting",
+                    phase: .releases,
+                    isIndeterminate: true
+                )
+            }
 
             // Speed win: batch-resolve all cached catalog IDs in one call (chunked by 25)
             // instead of doing a separate network round-trip per artist.
@@ -136,21 +158,57 @@ final class RefreshCoordinator {
             let cachedIDs = appleInputs.compactMap { $0.catalogArtistID }.filter { !$0.isEmpty }
             Log.v("[Refresh] apple=\(appleInputs.count), cachedIDs=\(cachedIDs.count), about to preResolve")
             let preResolveStart = Date()
-            // Pre-resolve cached artists *and* the storefront concurrently.
-            // Storefront used to be re-fetched ~2× per artist inside the REST
-            // helpers; resolving once here saves N round-trips on every refresh.
-            async let preResolvedTask = appleService.preResolveCachedArtists(catalogIDs: cachedIDs)
-            async let storefrontTask = appleService.resolveStorefrontCountryCode()
+            // Pre-resolve cached artists *and* the storefront concurrently,
+            // each races a 20s timeout so a stalled itunescloudd can't pin
+            // the refresh in pre-resolve forever (we observed this on a
+            // fresh install while CloudKit was saturating the device).
+            // Fallbacks: empty dict for cached artists (caller falls back
+            // to per-artist resolution), "us" for storefront.
+            async let preResolvedTask = Self.raceWithTimeout(
+                seconds: 20,
+                fallback: [String: Artist]()
+            ) {
+                await appleService.preResolveCachedArtists(catalogIDs: cachedIDs)
+            }
+            async let storefrontTask = Self.raceWithTimeout(
+                seconds: 20,
+                fallback: "us"
+            ) {
+                await appleService.resolveStorefrontCountryCode()
+            }
             let preResolved = await preResolvedTask
             let storefront = await storefrontTask
             Log.v("[Refresh] preResolve done in \(String(format: "%.2f", Date().timeIntervalSince(preResolveStart)))s, resolved=\(preResolved.count), storefront=\(storefront)")
 
-            var collected: [FetchedRelease] = []
+            // Streaming upsert: the actor lives on a background executor,
+            // shares the main ModelContainer, and each `applyBatch` call
+            // commits a small transaction that propagates to the @Query on
+            // Home — so the feed fills in artist-by-artist instead of all
+            // at once after the task group drains.
+            let upsertActor = ReleaseUpsertActor(modelContainer: modelContainer)
+            let releaseService = ReleaseRefreshService()
+            var streamingState = ReleaseRefreshService.StreamingRefreshState()
+            // Flush whenever the buffer hits this many releases or it has
+            // been ~4s since the last flush, whichever fires first. Threshold
+            // was 24 / 1.5s — too aggressive on stores with thousands of
+            // releases (every flush re-fires `@Query<ReleaseData>`, which
+            // makes Home re-walk every snapshot and rebuild `derived`,
+            // producing visible UI lag during refresh).
+            let flushThreshold = 60
+            let flushInterval: TimeInterval = 4.0
+            var pendingReleases: [FetchedRelease] = []
+            var lastFlushAt = Date()
+
             var failures: [String] = []
             var resolvedCatalogIDs: [String: String] = [:]
             var resolvedArtworkURLs: [String: URL] = [:]
             var checkedCount = 0
             var lastProgressDispatch = Date.distantPast
+            // Per-artist retry counter, keyed by providerID. Capped at 1
+            // retry on the first refresh (the path most prone to flake);
+            // incremental refreshes don't retry — user can re-trigger.
+            let maxRetriesPerInput = isFirstRefresh ? 1 : 0
+            var retryAttempts: [String: Int] = [:]
 
             await withTaskGroup(of: ArtistFetchOutcome.self) { group in
                 var nextIndex = 0
@@ -159,8 +217,7 @@ final class RefreshCoordinator {
                 var currentCap = initialCap
                 var cleanStreak = 0
 
-                func enqueue(_ index: Int) {
-                    let input = inputs[index]
+                func enqueue(_ input: ArtistFetchInput) {
                     let cached = input.catalogArtistID.flatMap { preResolved[$0] }
                     group.addTask {
                         let started = Date()
@@ -170,8 +227,7 @@ final class RefreshCoordinator {
                             outcome = await appleService.fetchOne(
                                 input,
                                 preResolvedArtist: cached,
-                                storefront: storefront,
-                                daysSinceLastRefresh: daysSinceLastRefresh
+                                storefront: storefront
                             )
                         case .spotify:
                             outcome = await spotifyService.fetchOne(input)
@@ -185,7 +241,7 @@ final class RefreshCoordinator {
                 }
 
                 while nextIndex < currentCap && nextIndex < totalCount {
-                    enqueue(nextIndex)
+                    enqueue(inputs[nextIndex])
                     inFlight += 1
                     nextIndex += 1
                 }
@@ -194,16 +250,55 @@ final class RefreshCoordinator {
                     if Task.isCancelled { break }
 
                     inFlight -= 1
+
+                    // Failed outcome: if we have retries left for this input,
+                    // requeue it instead of counting it. Doesn't bump
+                    // checkedCount yet — that happens when the retry returns
+                    // (or this is the final attempt).
+                    let providerID = outcome.input.providerID
+                    let attemptsSoFar = retryAttempts[providerID] ?? 0
+                    let shouldRetry = outcome.errorMessage != nil
+                        && attemptsSoFar < maxRetriesPerInput
+                        && !Task.isCancelled
+                    if shouldRetry {
+                        retryAttempts[providerID] = attemptsSoFar + 1
+                        Log.v("[Refresh] retrying \(outcome.input.name) (attempt \(attemptsSoFar + 2))")
+                        enqueue(outcome.input)
+                        inFlight += 1
+                        // Don't refill from `inputs` this iteration — the retry
+                        // re-uses the slot.
+                        continue
+                    }
+
                     checkedCount += 1
-                    collected.append(contentsOf: outcome.releases)
+                    pendingReleases.append(contentsOf: outcome.releases)
                     if let catID = outcome.catalogArtistID {
-                        resolvedCatalogIDs[outcome.input.providerID] = catID
+                        resolvedCatalogIDs[providerID] = catID
                     }
                     if let art = outcome.artworkURL {
-                        resolvedArtworkURLs[outcome.input.providerID] = art
+                        resolvedArtworkURLs[providerID] = art
                     }
                     if let err = outcome.errorMessage {
                         failures.append("\(outcome.input.name): \(err)")
+                    }
+
+                    // Streaming flush: enough releases buffered, or it's
+                    // been long enough since the last flush. Awaiting here
+                    // briefly blocks the loop, but the bounded fetch +
+                    // small save is fast (typically <50ms) and the user
+                    // perceived win — feed filling in live — is huge.
+                    let nowFlushCheck = Date()
+                    if pendingReleases.count >= flushThreshold
+                        || nowFlushCheck.timeIntervalSince(lastFlushAt) >= flushInterval {
+                        let batch = pendingReleases
+                        pendingReleases.removeAll(keepingCapacity: true)
+                        lastFlushAt = nowFlushCheck
+                        await releaseService.applyStreamingBatch(
+                            releases: batch,
+                            state: &streamingState,
+                            actor: upsertActor,
+                            now: Date()
+                        )
                     }
 
                     // AIMD update: detected rate-limit halves the cap; ten
@@ -244,7 +339,7 @@ final class RefreshCoordinator {
                     // Re-fill up to current cap. May enqueue 0 (cap dropped),
                     // 1 (steady), or 2 (cap just bumped after this outcome).
                     while inFlight < currentCap && nextIndex < totalCount && !Task.isCancelled {
-                        enqueue(nextIndex)
+                        enqueue(inputs[nextIndex])
                         inFlight += 1
                         nextIndex += 1
                     }
@@ -263,19 +358,39 @@ final class RefreshCoordinator {
                 return
             }
 
-            let fetchResult = ReleaseFetchResult(
-                releases: collected,
+            // Final streaming flush: anything still buffered from the last
+            // few outcomes goes in one last bounded upsert before finalize.
+            if !pendingReleases.isEmpty {
+                let batch = pendingReleases
+                pendingReleases.removeAll(keepingCapacity: false)
+                await releaseService.applyStreamingBatch(
+                    releases: batch,
+                    state: &streamingState,
+                    actor: upsertActor,
+                    now: Date()
+                )
+            }
+
+            // Apply tracked-artist metadata + finalize on main. The metadata
+            // write fires one @Query; finalize fires another after building
+            // notification specs + widget snapshot + playlist candidates.
+            let resolvedCatalogIDsSnapshot = resolvedCatalogIDs
+            let resolvedArtworkURLsSnapshot = resolvedArtworkURLs
+            await MainActor.run {
+                releaseService.applyArtistMetadata(
+                    resolvedCatalogIDs: resolvedCatalogIDsSnapshot,
+                    resolvedArtworkURLs: resolvedArtworkURLsSnapshot,
+                    trackedArtists: trackedArtists,
+                    modelContext: modelContext,
+                    now: Date()
+                )
+            }
+
+            let summary = await releaseService.finalizeRefresh(
+                state: streamingState,
                 failures: failures,
                 checkedArtists: checkedCount,
                 totalArtists: totalCount,
-                resolvedCatalogIDs: resolvedCatalogIDs,
-                resolvedArtworkURLs: resolvedArtworkURLs,
-                storefrontCountryCode: nil
-            )
-
-            // service.apply is @MainActor → automatic hop to main for SwiftData + notifications.
-            let summary = await ReleaseRefreshService().apply(
-                result: fetchResult,
                 trackedArtists: trackedArtists,
                 modelContext: modelContext,
                 scheduleNotifications: true,
@@ -283,11 +398,20 @@ final class RefreshCoordinator {
                 notificationMinute: notificationMinute
             )
 
-            // Videos + concerts: the network fetches already ran in parallel
-            // with the release fetch (see async let above). Now we just await
-            // the results and hand them to the @MainActor apply step. Because
-            // the fetch is already done, the "Looking for new videos…" phase
-            // is typically near-instant instead of the 5–10s it used to take.
+            // Catalog IDs that were freshly resolved during this refresh can
+            // expose duplicate artists that the launch-time dedup couldn't
+            // see (because the rows hadn't had `catalogArtistID` set yet).
+            // Run dedup once more so those duplicates collapse before the
+            // user notices a "via X" row from an untracked-looking artist.
+            await MainActor.run {
+                CloudSyncDeduplicator.run(in: modelContext)
+            }
+
+            // Videos: the network fetch already ran in parallel with the release
+            // fetch (see async let above). Now we just await the result and hand
+            // it to the @MainActor apply step. Because the fetch is already done,
+            // the "Looking for new videos…" phase is typically near-instant
+            // instead of the 5–10s it used to take.
             if videosEnabled && !Task.isCancelled {
                 await MainActor.run { [weak self] in
                     self?.progress = ReleaseRefreshProgress(
@@ -303,23 +427,6 @@ final class RefreshCoordinator {
                     trackedArtists: trackedArtists,
                     modelContext: modelContext,
                     prefetched: prefetchedVideos
-                )
-            }
-            if concertsEnabled && !Task.isCancelled {
-                await MainActor.run { [weak self] in
-                    self?.progress = ReleaseRefreshProgress(
-                        checkedArtists: totalCount,
-                        totalArtists: totalCount,
-                        currentArtistName: RefreshPhase.concerts.rawValue,
-                        phase: .concerts,
-                        isIndeterminate: true
-                    )
-                }
-                let prefetchedConcerts = await concertFetchTask
-                _ = await ConcertRefreshService().refresh(
-                    trackedArtists: trackedArtists,
-                    modelContext: modelContext,
-                    prefetched: prefetchedConcerts
                 )
             }
 
@@ -351,19 +458,58 @@ final class RefreshCoordinator {
         Self.setWidgetRefreshFlag(false)
     }
 
-    /// Race a MusicSubscription.current lookup against a timeout, so a hung
-    /// identity-resolution can't block the refresh indefinitely.
-    private static func warmUpMusicKitIdentity(timeout seconds: Double) async {
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                _ = try? await MusicSubscription.current
-            }
+    /// Run `operation` against a timeout, returning `fallback` if the
+    /// timeout fires first. Used to keep pre-resolve from pinning the
+    /// refresh in `.warming` when itunescloudd is slow.
+    private static func raceWithTimeout<T: Sendable>(
+        seconds: Double,
+        fallback: T,
+        operation: @Sendable @escaping () async -> T
+    ) async -> T {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask { await operation() }
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return nil
             }
-            _ = await group.next()
+            let first = await group.next() ?? nil
             group.cancelAll()
+            return first ?? fallback
         }
+    }
+
+    /// Kick `MusicSubscription.current` so any later catalog calls find a
+    /// warm identity, but never block on it. The call can hang
+    /// indefinitely when iTunes account services are stalled (the device
+    /// keeps logging `-7013 "Client is not entitled to access account
+    /// store"`) and it doesn't honor structured-concurrency cancellation
+    /// — so the previous `withTaskGroup` race would deadlock on the
+    /// implicit "wait for children" at the end of the group body.
+    ///
+    /// Fire-and-forget instead. We sleep the timeout window so warmup
+    /// *might* complete before the rest of the refresh proceeds, then
+    /// return regardless. The detached task continues in the background
+    /// and resolves whenever the system finally responds (or gets torn
+    /// down on app exit). Worst case we lose the warmup optimization;
+    /// the actual catalog fetches do not depend on a subscription.
+    /// Block until MusicKit authorization is in a settled state (.authorized
+    /// / .denied / .restricted). Returns immediately when already settled;
+    /// when `.notDetermined`, awaits `MusicAuthorization.request()` which
+    /// shows the system prompt and resolves once the user picks. Prevents
+    /// any catalog / storefront call from firing while auth is in flight
+    /// (which used to surface as "Failed to fetch current country code …
+    /// notDetermined" log spam during auto-refresh-on-launch).
+    private static func awaitMusicAuthorizationResolved() async {
+        if MusicAuthorization.currentStatus == .notDetermined {
+            _ = await MusicAuthorization.request()
+        }
+    }
+
+    private static func warmUpMusicKitIdentity(timeout seconds: Double) async {
+        Task.detached(priority: .utility) {
+            _ = try? await MusicSubscription.current
+        }
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
     }
 
     /// Toggles the App Group flag the widget checks to decide whether to render its

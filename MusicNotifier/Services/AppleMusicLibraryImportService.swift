@@ -79,6 +79,18 @@ struct AppleMusicLibraryImportService {
 
         try modelContext.save()
 
+        // The dedup index above only sees rows present when the import
+        // started. If CloudKit mirroring lands a copy of the same artist
+        // mid-import (common on a fresh second-device install where the
+        // user starts importing before the cloud pull finishes), we'd
+        // end up with two rows sharing `(provider, providerID)`. Run the
+        // launch-time deduplicator here so the import is self-healing
+        // against that race.
+        // Forced: an import can race a CloudKit insert such that a duplicate
+        // appears without the net row count changing, which the count gate
+        // would otherwise skip.
+        CloudSyncDeduplicator.run(in: modelContext, force: true)
+
         // Kick off background artwork backfill — library API often returns nil artwork.
         Task { await backfillMissingArtwork(in: modelContext) }
 

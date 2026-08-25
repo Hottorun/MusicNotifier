@@ -45,7 +45,7 @@ struct AppleMusicPlaylistSync {
                     await addAlbumTracks(albumID: id, to: playlist)
                 }
             } catch {
-                print("[PlaylistSync] default playlist failed: \(String(reflecting: error))")
+                Log.v("[PlaylistSync] default playlist failed: \(String(reflecting: error))")
             }
         }
 
@@ -68,7 +68,7 @@ struct AppleMusicPlaylistSync {
                     await addAlbumTracks(albumID: candidate.albumProviderID, to: playlist)
                 }
             } catch {
-                print("[PlaylistSync] rule '\(rule.name)' failed: \(String(reflecting: error))")
+                Log.v("[PlaylistSync] rule '\(rule.name)' failed: \(String(reflecting: error))")
             }
         }
         if rulesChanged {
@@ -147,7 +147,7 @@ struct AppleMusicPlaylistSync {
             // album as a unit in their library / playlist.
             try await MusicLibrary.shared.add(album, to: playlist)
         } catch {
-            print("[PlaylistSync] album \(albumID) skipped: \(error.localizedDescription)")
+            Log.v("[PlaylistSync] album \(albumID) skipped: \(error.localizedDescription)")
         }
     }
 }

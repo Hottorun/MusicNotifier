@@ -325,6 +325,15 @@
 - [x] iPadOS layout — `NavigationSplitView` sidebar with Home / Upcoming / Artists rows, detail pane on the right. Auto-selected when `horizontalSizeClass == .regular`; compact size class still gets the bottom tab bar.
 - [x] macOS (Mac Catalyst) — Supported Destinations now includes Mac. `splitLayout` renders via the regular size class; existing `#if os(iOS) || targetEnvironment(macCatalyst)` guards keep MusicKit calls compatible.
 
+## Fetch Performance
+
+- [x] ~~**Batch album fetch via `include=albums`.**~~ Skipped — Apple's API doesn't reliably honor per-relationship `sort[albums]=-releaseDate`/`limit[albums]` on the batched include endpoint, so batching risks reintroducing the bug the single-artist `sort=-releaseDate` was added to fix (new singles getting buried under popular back-catalog).
+- [x] **Incremental `appears-on` window.** `fetchAppearsOnAlbumsViaREST` now takes `daysSinceLastRefresh + 3-day buffer` on incremental refreshes; falls back to 180 days only on the first-ever refresh.
+- [x] **Cache storefront in UserDefaults.** `currentStorefrontCountryCode()` caches the resolved code with a 7-day TTL under `cachedStorefrontCountryCode` / `cachedStorefrontCountryCodeAt`.
+- [x] **Interleaved retry in main task group.** Removed the separate post-loop retry sweep. Failed inputs are now re-enqueued into the same task group with a per-input attempt counter (cap = 1 retry, first-refresh only).
+- [x] **Drop `Calendar.dateComponents` in tight loops.** Replaced both per-album 365-day checks (`mapAlbums` + REST decoder) with `now.timeIntervalSince(releaseDate) > 365 * 86_400`.
+- [x] **Streaming upsert (incremental feed render).** `ReleaseUpsertActor` got `applyBatch` + `finalize`. `ReleaseRefreshService` got `applyStreamingBatch` + `finalizeRefresh` + `applyArtistMetadata`. `RefreshCoordinator` now flushes every 24 releases or 1.5s during the task group instead of accumulating into one big post-loop apply, so the Home `@Query` fills in artist-by-artist while the rest of the refresh keeps going. Notifications + widget snapshot + playlist sync + tracked-artist metadata writes still happen once at finalize.
+
 ## Testing
 
 - [x] Add focused unit tests for release grouping.

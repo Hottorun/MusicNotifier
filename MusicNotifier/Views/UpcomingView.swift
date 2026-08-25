@@ -88,6 +88,9 @@ struct UpcomingView: View {
     /// "tab switch takes 2s during refresh" hitch users reported. The walk
     /// now runs in `.task(id:)` after the first frame paints.
     @State private var cachedUpcomingDerived = UpcomingDerived()
+    /// Gates the debounce in `.task(id:)` — first walk runs immediately so the
+    /// list isn't empty on appear; later ones coalesce.
+    @State private var hasComputedUpcomingOnce = false
 
     /// Identity key for `.task(id:)`. When any of these change, the cache
     /// recomputes off the body's hot path.
@@ -115,34 +118,88 @@ struct UpcomingView: View {
         )
     }
 
-    private func makeUpcomingDerived() -> UpcomingDerived {
-        let trackedIDs = Set(trackedArtists.map(\.providerID))
-        let cutoff = Calendar.current.date(byAdding: .day, value: -45, to: Date()) ?? .distantPast
-        var out = UpcomingDerived()
+    /// Sendable projection for the off-main walk — only the scalars the
+    /// bucketing reads.
+    private struct UpcomingSnapshot: Sendable {
+        let id: PersistentIdentifier
+        let artistProviderID: String
+        let kind: ReleaseKind
+        let releaseDate: Date?
+        let isDismissed: Bool
+    }
+
+    private struct UpcomingDerivedIDs: Sendable {
+        var upcomingIDs: [PersistentIdentifier] = []
+        var calendarIDs: [PersistentIdentifier] = []
+    }
+
+    /// Genuinely off-main variant of `makeUpcomingDerived`.
+    ///
+    /// `.task(id:)` closures inherit the view's MainActor isolation, so the
+    /// previous `let next = makeUpcomingDerived(); await MainActor.run { … }`
+    /// ran the whole walk on the main thread — the `MainActor.run` hop was a
+    /// no-op. The walk was deferred by a frame but never moved off, so every
+    /// SwiftData save during a fetch still stalled scrolling on this tab.
+    private func makeUpcomingDerivedAsync() async -> UpcomingDerived {
+        var snapshots: [UpcomingSnapshot] = []
+        snapshots.reserveCapacity(storedReleases.count)
+        var lookup: [PersistentIdentifier: ReleaseData] = [:]
+        lookup.reserveCapacity(storedReleases.count)
         for release in storedReleases {
-            guard release.dismissedAt == nil else { continue }
-            guard trackedIDs.contains(release.artistProviderID) else { continue }
-            guard kindIsGloballyVisible(release.kind) else { continue }
-            if release.isUpcoming {
-                out.upcoming.append(release)
-                out.calendar.append(release)
-            } else if let date = release.releaseDate, date >= cutoff {
-                out.calendar.append(release)
-            }
+            let id = release.persistentModelID
+            snapshots.append(
+                UpcomingSnapshot(
+                    id: id,
+                    artistProviderID: release.artistProviderID,
+                    kind: release.kind,
+                    releaseDate: release.releaseDate,
+                    isDismissed: release.dismissedAt != nil
+                )
+            )
+            if lookup[id] == nil { lookup[id] = release }
         }
+
+        let trackedIDs = Set(trackedArtists.map(\.providerID))
+        let day = ReleaseDayBoundaries.snapshot()
+        let cutoff = Calendar.current.date(byAdding: .day, value: -45, to: Date()) ?? .distantPast
+        let kinds = visibleKindsSet()
+
+        let ids = await Task.detached(priority: .userInitiated) {
+            var out = UpcomingDerivedIDs()
+            for snapshot in snapshots {
+                guard !snapshot.isDismissed else { continue }
+                guard trackedIDs.contains(snapshot.artistProviderID) else { continue }
+                guard kinds.contains(snapshot.kind) else { continue }
+                guard let releaseDate = snapshot.releaseDate else { continue }
+                if releaseDate >= day.startOfTomorrow {
+                    out.upcomingIDs.append(snapshot.id)
+                    out.calendarIDs.append(snapshot.id)
+                } else if releaseDate >= cutoff {
+                    out.calendarIDs.append(snapshot.id)
+                }
+            }
+            return out
+        }.value
+
+        var out = UpcomingDerived()
+        out.upcoming = ids.upcomingIDs.compactMap { lookup[$0] }
+        out.calendar = ids.calendarIDs.compactMap { lookup[$0] }
+        // `storedReleases` is already `@Query(sort: \.releaseDate)` ascending,
+        // so the upcoming bucket comes out in order — but re-sort explicitly
+        // rather than depending on the query's ordering.
         out.upcoming.sort { ($0.releaseDate ?? .distantFuture) < ($1.releaseDate ?? .distantFuture) }
         return out
     }
 
-    private func kindIsGloballyVisible(_ kind: ReleaseKind) -> Bool {
-        switch kind {
-        case .album: return showAlbums
-        case .single: return showSingles
-        case .ep: return showEPs
-        case .liveAlbum: return showLiveAlbums
-        case .compilation: return showCompilations
-        case .remix: return showRemixes
-        }
+    private func visibleKindsSet() -> Set<ReleaseKind> {
+        var kinds: Set<ReleaseKind> = []
+        if showAlbums { kinds.insert(.album) }
+        if showSingles { kinds.insert(.single) }
+        if showEPs { kinds.insert(.ep) }
+        if showLiveAlbums { kinds.insert(.liveAlbum) }
+        if showCompilations { kinds.insert(.compilation) }
+        if showRemixes { kinds.insert(.remix) }
+        return kinds
     }
 
     var body: some View {
@@ -177,6 +234,11 @@ struct UpcomingView: View {
             .navigationDestination(for: ReleaseData.self) { release in
                 AlbumView(release: release)
             }
+            // Artist pushes from AlbumView / ArtistDetailView resolve here —
+            // see the note at the Artists tab's stack root.
+            .navigationDestination(for: ArtistData.self) { artist in
+                ArtistDetailView(artist: artist)
+            }
             .task {
                 ImagePrefetcher.prefetch(derived.upcoming.prefix(60).map(\.artworkURL))
                 let topIDs = derived.upcoming.prefix(10).map(\.providerID)
@@ -189,8 +251,18 @@ struct UpcomingView: View {
             // critical during refresh, when SwiftData @Query invalidations
             // would otherwise force a synchronous walk on every save.
             .task(id: upcomingDerivedKey) {
-                let next = makeUpcomingDerived()
-                await MainActor.run { cachedUpcomingDerived = next }
+                // Debounce after the first walk — see the note in
+                // `makeUpcomingDerivedAsync`. Each SwiftData batch commit
+                // during a refresh changes `releaseCount`, restarting this
+                // task; sleeping first collapses a burst into one walk.
+                if hasComputedUpcomingOnce {
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    if Task.isCancelled { return }
+                }
+                let next = await makeUpcomingDerivedAsync()
+                if Task.isCancelled { return }
+                cachedUpcomingDerived = next
+                hasComputedUpcomingOnce = true
             }
         }
     }
@@ -204,7 +276,13 @@ struct UpcomingView: View {
                 .foregroundStyle(AppTheme.primaryText)
 
             HStack(spacing: 8) {
-                inlineMetric(value: upcomingCount, label: "upcoming", color: .white)
+                // `.white` made the count invisible on the light background.
+                // Match the Feed's unread metric: accent when non-zero.
+                inlineMetric(
+                    value: upcomingCount,
+                    label: "upcoming",
+                    color: upcomingCount > 0 ? AppTheme.accent : AppTheme.secondary
+                )
                 Spacer()
                 layoutToggle
             }

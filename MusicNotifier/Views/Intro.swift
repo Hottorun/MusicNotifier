@@ -17,10 +17,17 @@ struct Intro: View {
     @State private var authorizationMessage: String?
     @State private var isChoosingArtists = false
     @State private var authorizationDenied = false
+    // User explicitly chose "I already have a watchlist in iCloud — wait
+    // for it" — drives the ICloudSyncWaitingView takeover.
+    @State private var isWaitingForICloud = false
     
     var body: some View {
         NavigationStack {
-            if isChoosingArtists {
+            if isWaitingForICloud {
+                ICloudSyncWaitingView(
+                    onCancel: { isWaitingForICloud = false }
+                )
+            } else if isChoosingArtists {
                 OnboardingArtistImportView(
                     onFinish: { hasCompletedOnboarding = true }
                 )
@@ -84,6 +91,26 @@ struct Intro: View {
                             }
                             .buttonStyle(GhostButtonStyle())
                         }
+
+                        // Returning-user escape hatch. If they've used
+                        // MusicNotifier before and have an iCloud-mirrored
+                        // watchlist, skip the provider/import flow entirely
+                        // and just sit on a waiting screen until CloudKit
+                        // delivers — which on a fresh install can take
+                        // several minutes for a real watchlist.
+                        Button {
+                            isWaitingForICloud = true
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "icloud.fill")
+                                    .font(.footnote)
+                                Text("I already have a watchlist in iCloud")
+                                    .font(.footnote.weight(.semibold))
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(AppTheme.accent)
+                        .padding(.top, 8)
                     }
                     .padding(.horizontal, 20)
                     .padding(.bottom, 32)
@@ -409,8 +436,18 @@ private struct OnboardingArtistImportView: View {
         importMessage = nil
 
         do {
-            _ = try await AppleMusicLibraryImportService().importArtists(mode: importMode, into: modelContext)
-            importMessage = nil
+            // Always report the outcome. Reporting only failures meant a
+            // library with nothing to import (or nothing matching the mode)
+            // looked identical to a button that did nothing at all.
+            let imported = try await AppleMusicLibraryImportService()
+                .importArtists(mode: importMode, into: modelContext)
+            if imported > 0 {
+                importMessage = "Imported \(imported) artist\(imported == 1 ? "" : "s")."
+            } else if artists.isEmpty {
+                importMessage = "No artists found in your Apple Music library for this import mode."
+            } else {
+                importMessage = "No new artists to import — everything is already here."
+            }
         } catch {
             importMessage = "Could not import artists: \(error.localizedDescription)"
         }
